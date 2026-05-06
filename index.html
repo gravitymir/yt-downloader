@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>YouTube Downloader</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        :root {
+            color-scheme: light dark;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #0f172a;
+            color: #f8fafc;
+        }
+        body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .wrapper { width: min(900px, 90vw); padding: 3rem 4vw; }
+        h1 { margin-bottom: 1.5rem; font-size: clamp(2rem, 4vw, 3rem); }
+        form { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 1.5rem; }
+        input[type="text"] {
+            flex: 1 1 400px; padding: 0.85rem 1rem; border-radius: 0.75rem;
+            border: 1px solid rgba(255, 255, 255, 0.1); background: rgba(15, 23, 42, 0.6); color: inherit; font-size: 1rem;
+        }
+        button {
+            padding: 0.85rem 1.5rem; border-radius: 0.75rem; border: none; font-size: 1rem; font-weight: 600;
+            cursor: pointer; color: #0f172a; background: linear-gradient(135deg,#38bdf8,#22d3ee);
+        }
+        button:hover { transform: translateY(-1px); box-shadow: 0 10px 25px rgba(34, 211, 238, 0.2); }
+        .alert { padding: 1rem 1.25rem; border-radius: 0.75rem; margin-bottom: 1.5rem; font-weight: 500; }
+        .alert.error { background: rgba(239, 68, 68, 0.15); color: #fecaca; border: 1px solid rgba(239, 68, 68, 0.4); }
+        .alert.success { background: rgba(34, 197, 94, 0.18); color: #bbf7d0; border: 1px solid rgba(34, 197, 94, 0.4); }
+        .placeholder {
+            padding: 2rem; border-radius: 1rem; background: rgba(148, 163, 184, 0.12);
+            border: 1px dashed rgba(148, 163, 184, 0.4); color: rgba(226, 232, 240, 0.9); line-height: 1.6;
+        }
+        .card {
+            display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            background: rgba(148, 163, 184, 0.08); border-radius: 1.25rem; padding: 1.75rem; border: 1px solid rgba(148, 163, 184, 0.2);
+        }
+        .card img { width: 100%; border-radius: 1rem; border: 1px solid rgba(148, 163, 184, 0.3); object-fit: cover; max-height: 220px; }
+        .meta { display: grid; gap: 0.75rem; }
+        .meta h2 { margin: 0; font-size: 1.5rem; line-height: 1.3; }
+        .meta .stats { display: flex; flex-wrap: wrap; gap: 0.75rem; font-size: 0.95rem; color: rgba(226, 232, 240, 0.9); }
+        .meta .stats span { background: rgba(148, 163, 184, 0.16); padding: 0.35rem 0.75rem; border-radius: 999px; }
+        .card .links { display: grid; gap: 0.75rem; }
+        .format-list { margin-top: 1.25rem; display: grid; gap: 0.75rem; }
+        .format-list h3 { margin: 0; font-size: 1.05rem; font-weight: 600; color: rgba(226, 232, 240, 0.95); }
+        .format-filter { display: flex; flex-wrap: wrap; gap: 1rem; margin: 0.5rem 0 0.75rem; align-items: center; padding: 0.5rem 0; }
+        .format-filter-label { font-size: 0.9rem; font-weight: 500; color: rgba(226, 232, 240, 0.85); margin-right: 0.25rem; }
+        .format-filter label { display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer; font-size: 0.9rem; color: rgba(226, 232, 240, 0.9); }
+        .format-filter input[type="radio"] { accent-color: #38bdf8; cursor: pointer; }
+        .format-card[data-hidden="true"] { display: none; }
+        .format-grid { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+        .format-card {
+            display: grid; gap: 0.35rem; background: rgba(30, 41, 59, 0.6); border: 1px solid rgba(148, 163, 184, 0.25);
+            border-radius: 0.9rem; padding: 0.85rem 1rem; text-decoration: none; color: inherit; cursor: pointer;
+            flex: 1 1 220px; transition: transform 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+        }
+        .format-card:hover { transform: translateY(-1px); border-color: rgba(56, 189, 248, 0.6); box-shadow: 0 10px 24px rgba(56, 189, 248, 0.12); }
+        .format-card.loading { opacity: 0.65; pointer-events: none; }
+        .format-card.success { border-color: rgba(34, 197, 94, 0.6); }
+        .format-card.error { border-color: rgba(239, 68, 68, 0.6); }
+        .format-badge { font-size: 0.8rem; font-weight: 600; text-transform: uppercase; color: rgba(148, 163, 184, 0.9); }
+        .format-quality { font-size: 1.05rem; font-weight: 600; }
+        .format-codecs { font-size: 0.85rem; color: rgba(226, 232, 240, 0.75); }
+        .format-meta { font-size: 0.82rem; color: rgba(226, 232, 240, 0.7); }
+        .format-note { font-size: 0.78rem; color: rgba(248, 250, 252, 0.6); }
+        .format-status { font-size: 0.78rem; color: rgba(226, 232, 240, 0.7); }
+        .format-card.success .format-status { color: #bbf7d0; }
+        .format-card.error .format-status { color: #fecaca; }
+        a { color: #38bdf8; }
+        .muted { color: rgba(226, 232, 240, 0.65); }
+    </style>
+</head>
+<body>
+    <div class="wrapper">
+        <h1>YouTube Downloader</h1>
+        <form method="get" action="/">
+            <input type="text" name="url" placeholder="https://www.youtube.com/watch?v=..." value="{{ESCAPED_INPUT}}" autocomplete="off" />
+            <button type="submit">Check video</button>
+        </form>
+        {{RESULT_SECTION}}
+    </div>
+    <script>
+        document.addEventListener("DOMContentLoaded", () => {
+            const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+            document.querySelectorAll('input[name="format-filter"]').forEach((radio) => {
+                radio.addEventListener("change", () => {
+                    const value = radio.value;
+                    document.querySelectorAll(".format-card[data-stream-type]").forEach((card) => {
+                        const type = card.dataset.streamType;
+                        const show = value === "all" || type === value;
+                        card.dataset.hidden = show ? "false" : "true";
+                    });
+                });
+            });
+            document.querySelectorAll(".format-card[data-endpoint]").forEach((card) => {
+                card.addEventListener("click", async (e) => {
+                    e.preventDefault();
+                    if (card.classList.contains("loading")) return;
+                    const endpoint = card.dataset.endpoint;
+                    if (!endpoint) return;
+                    const statusEl = card.querySelector(".format-status");
+                    card.classList.remove("success", "error"); card.classList.add("loading");
+                    if (statusEl) statusEl.textContent = "Starting download…";
+                    try {
+                        const res = await fetch(endpoint, { headers: { "X-Requested-With": "fetch" } });
+                        const text = await res.text();
+                        let data; try { data = JSON.parse(text); } catch { throw new Error(text || "Unexpected response"); }
+                        if (!res.ok || data.status !== "started") throw new Error(data.message || "Unable to start download");
+                        const trackResult = await (async () => {
+                            for (;;) {
+                                const r = await fetch("/download/status?id=" + encodeURIComponent(data.jobId), { headers: { "X-Requested-With": "fetch" } });
+                                const t = await r.text();
+                                let d; try { d = JSON.parse(t); } catch { throw new Error(t); }
+                                if (!r.ok) throw new Error(d.message || "Progress failed");
+                                if (statusEl) {
+                                    if (d.status === "running") statusEl.textContent = "Downloading… " + (d.percent || 0) + "%";
+                                    else if (d.status === "completed") statusEl.textContent = d.message || "Saved";
+                                    else if (d.status === "failed") statusEl.textContent = d.error || "Failed";
+                                }
+                                if (d.status === "completed") return { success: true, message: d.message };
+                                if (d.status === "failed") return { success: false, error: d.error || "Failed" };
+                                await delay(600);
+                            }
+                        })();
+                        card.classList.remove("loading");
+                        if (trackResult.success) { card.classList.add("success"); if (statusEl) statusEl.textContent = trackResult.message || "Saved"; }
+                        else { card.classList.add("error"); if (statusEl) statusEl.textContent = trackResult.error || "Failed"; }
+                    } catch (err) {
+                        card.classList.remove("loading"); card.classList.add("error");
+                        if (statusEl) statusEl.textContent = err.message || "Failed";
+                    }
+                });
+            });
+        });
+    </script>
+</body>
+</html>
