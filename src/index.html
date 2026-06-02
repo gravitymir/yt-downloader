@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>YouTube Downloader</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        :root {
+            color-scheme: light dark;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #0f172a;
+            color: #f8fafc;
+        }
+        body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .wrapper { width: min(900px, 90vw); padding: 3rem 4vw; }
+        h1 { margin-bottom: 1.5rem; font-size: clamp(2rem, 4vw, 3rem); }
+        form { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 1.5rem; }
+        input[type="text"] {
+            flex: 1 1 400px; padding: 0.85rem 1rem; border-radius: 0.75rem;
+            border: 1px solid rgba(255, 255, 255, 0.1); background: rgba(15, 23, 42, 0.6); color: inherit; font-size: 1rem;
+        }
+        button {
+            padding: 0.85rem 1.5rem; border-radius: 0.75rem; border: none; font-size: 1rem; font-weight: 600;
+            cursor: pointer; color: #0f172a; background: linear-gradient(135deg,#38bdf8,#22d3ee);
+        }
+        button:hover { transform: translateY(-1px); box-shadow: 0 10px 25px rgba(34, 211, 238, 0.2); }
+        .alert { padding: 1rem 1.25rem; border-radius: 0.75rem; margin-bottom: 1.5rem; font-weight: 500; }
+        .alert.error { background: rgba(239, 68, 68, 0.15); color: #fecaca; border: 1px solid rgba(239, 68, 68, 0.4); }
+        .alert.success { background: rgba(34, 197, 94, 0.18); color: #bbf7d0; border: 1px solid rgba(34, 197, 94, 0.4); }
+        .placeholder {
+            padding: 2rem; border-radius: 1rem; background: rgba(148, 163, 184, 0.12);
+            border: 1px dashed rgba(148, 163, 184, 0.4); color: rgba(226, 232, 240, 0.9); line-height: 1.6;
+        }
+        .card {
+            display: flex; flex-direction: column; gap: 1.5rem;
+            background: rgba(148, 163, 184, 0.08); border-radius: 1.25rem; padding: 1.75rem; border: 1px solid rgba(148, 163, 184, 0.2);
+        }
+        .card-head { display: grid; grid-template-columns: minmax(0, 280px) 1fr; gap: 1.5rem; align-items: start; }
+        @media (max-width: 560px) { .card-head { grid-template-columns: 1fr; } }
+        .card img { width: 100%; border-radius: 1rem; border: 1px solid rgba(148, 163, 184, 0.3); object-fit: cover; max-height: 220px; }
+        .meta { display: grid; gap: 0.75rem; align-content: start; }
+        .meta h2 { margin: 0; font-size: 1.5rem; line-height: 1.3; }
+        .meta .stats { display: flex; flex-wrap: wrap; gap: 0.75rem; font-size: 0.95rem; color: rgba(226, 232, 240, 0.9); }
+        .meta .stats span { background: rgba(148, 163, 184, 0.16); padding: 0.35rem 0.75rem; border-radius: 999px; }
+        .card .links { display: grid; gap: 0.75rem; }
+        .format-list { margin-top: 1.25rem; display: grid; gap: 0.75rem; }
+        .format-list h3 { margin: 0; font-size: 1.05rem; font-weight: 600; color: rgba(226, 232, 240, 0.95); }
+        .format-filter { display: flex; flex-wrap: wrap; gap: 1rem; margin: 0.5rem 0 0.75rem; align-items: center; padding: 0.5rem 0; }
+        .format-filter-label { font-size: 0.9rem; font-weight: 500; color: rgba(226, 232, 240, 0.85); margin-right: 0.25rem; }
+        .format-filter label { display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer; font-size: 0.9rem; color: rgba(226, 232, 240, 0.9); }
+        .format-filter input[type="radio"] { accent-color: #38bdf8; cursor: pointer; }
+        .format-card[data-hidden="true"] { display: none; }
+        .format-grid { display: grid; gap: 0.4rem; }
+        .format-card {
+            display: flex; align-items: center; flex-wrap: wrap; gap: 0.55rem; font-size: 0.92rem;
+            background: rgba(30, 41, 59, 0.6); border: 1px solid rgba(148, 163, 184, 0.25);
+            border-radius: 0.6rem; padding: 0.55rem 0.85rem; text-decoration: none; color: inherit; cursor: pointer;
+            transition: transform 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+        }
+        .format-card:hover { transform: translateY(-1px); border-color: rgba(56, 189, 248, 0.6); box-shadow: 0 8px 18px rgba(56, 189, 248, 0.12); }
+        .format-card.loading { opacity: 0.65; pointer-events: none; }
+        .format-card.success { border-color: rgba(34, 197, 94, 0.6); }
+        .format-card.error { border-color: rgba(239, 68, 68, 0.6); }
+        .format-itag { font-weight: 700; color: #38bdf8; font-variant-numeric: tabular-nums; min-width: 2.6rem; }
+        .format-sep { color: rgba(148, 163, 184, 0.4); }
+        .format-quality { font-weight: 600; }
+        .format-codecs { color: rgba(226, 232, 240, 0.8); }
+        .format-meta { color: rgba(226, 232, 240, 0.7); }
+        .format-status { margin-left: auto; font-size: 0.8rem; color: rgba(226, 232, 240, 0.7); }
+        .format-card.success .format-status { color: #bbf7d0; }
+        .format-card.error .format-status { color: #fecaca; }
+        a { color: #38bdf8; }
+        .muted { color: rgba(226, 232, 240, 0.65); }
+
+        /* File explorer */
+        .explorer {
+            margin-top: 2rem; background: rgba(148, 163, 184, 0.08); border-radius: 1.25rem;
+            padding: 1.5rem 1.75rem; border: 1px solid rgba(148, 163, 184, 0.2);
+        }
+        .explorer-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem; }
+        .explorer-head h3 { margin: 0; font-size: 1.1rem; }
+        #open-folder { cursor: pointer; user-select: none; transition: color 0.12s ease; }
+        #open-folder:hover { color: #7dd3fc; text-decoration: underline; }
+        #open-folder:focus-visible { outline: 2px solid rgba(56, 189, 248, 0.7); outline-offset: 3px; border-radius: 0.4rem; }
+        .explorer-actions { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+        .btn-secondary {
+            padding: 0.55rem 1rem; font-size: 0.9rem; color: #f8fafc;
+            background: rgba(148, 163, 184, 0.18); border: 1px solid rgba(148, 163, 184, 0.3);
+        }
+        .btn-secondary:hover { background: rgba(148, 163, 184, 0.28); box-shadow: none; }
+        #merge-btn, #mp3-btn { padding: 0.55rem 1.1rem; font-size: 0.9rem; }
+        #merge-btn:disabled, #mp3-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+        .explorer-status { margin: 0.85rem 0 0; font-size: 0.85rem; min-height: 1.1rem; color: rgba(226, 232, 240, 0.8); }
+        .explorer-status.error { color: #fecaca; }
+        .explorer-status.success { color: #bbf7d0; }
+        .file-list { margin-top: 0.85rem; display: grid; gap: 0.5rem; }
+        .file-row {
+            display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 0.85rem;
+            background: rgba(30, 41, 59, 0.6); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 0.7rem;
+        }
+        .file-row input[type="checkbox"] {
+            appearance: none; -webkit-appearance: none; margin: 0; flex: 0 0 auto; cursor: pointer;
+            width: 1.25rem; height: 1.25rem; border-radius: 0.4rem;
+            border: 1px solid rgba(148, 163, 184, 0.5); background: rgba(15, 23, 42, 0.6);
+            display: inline-grid; place-content: center;
+            transition: background 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+        }
+        .file-row input[type="checkbox"]::before {
+            content: ""; width: 0.7rem; height: 0.7rem; transform: scale(0); transform-origin: center;
+            transition: transform 0.12s ease; background: #0f172a;
+            clip-path: polygon(14% 44%, 0 65%, 50% 100%, 100% 16%, 80% 0%, 43% 62%);
+        }
+        .file-row input[type="checkbox"]:hover { border-color: rgba(56, 189, 248, 0.7); }
+        .file-row input[type="checkbox"]:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.35); }
+        .file-row input[type="checkbox"]:checked { background: linear-gradient(135deg, #38bdf8, #22d3ee); border-color: transparent; }
+        .file-row input[type="checkbox"]:checked::before { transform: scale(1); }
+        .file-row label { flex: 1 1 auto; cursor: pointer; display: flex; align-items: center; gap: 0.6rem; min-width: 0; }
+        .file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .file-type {
+            flex: 0 0 auto; font-size: 0.7rem; text-transform: uppercase; font-weight: 600; letter-spacing: 0.03em;
+            padding: 0.15rem 0.5rem; border-radius: 999px;
+        }
+        .file-type.video { background: rgba(56, 189, 248, 0.18); color: #7dd3fc; }
+        .file-type.audio { background: rgba(168, 85, 247, 0.2); color: #d8b4fe; }
+        .file-type.other { background: rgba(148, 163, 184, 0.2); color: rgba(226, 232, 240, 0.85); }
+        .file-size { flex: 0 0 auto; font-size: 0.8rem; color: rgba(226, 232, 240, 0.6); }
+    </style>
+</head>
+<body>
+    <div class="wrapper">
+        <h1>YouTube Downloader</h1>
+        <form method="get" action="/">
+            <input type="text" name="url" placeholder="https://www.youtube.com/watch?v=..." value="{{ESCAPED_INPUT}}" autocomplete="off" />
+            <button type="submit">Check video</button>
+        </form>
+        {{RESULT_SECTION}}
+    </div>
+    <script>
+        document.addEventListener("DOMContentLoaded", () => {
+            const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+            // ---- File explorer + merge ----
+            const fileList = document.getElementById("file-list");
+            const mergeBtn = document.getElementById("merge-btn");
+            const mp3Btn = document.getElementById("mp3-btn");
+            const refreshBtn = document.getElementById("refresh-files");
+            const explorerStatus = document.getElementById("explorer-status");
+
+            const selectedNames = () =>
+                Array.from(fileList.querySelectorAll('input[type="checkbox"]:checked')).map((c) => c.value);
+
+            const formatSize = (bytes) => {
+                if (!bytes) return "0 B";
+                const units = ["B", "KB", "MB", "GB"];
+                let i = 0, n = bytes;
+                while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+                return n.toFixed(i === 0 ? 0 : 1) + " " + units[i];
+            };
+
+            const setStatus = (msg, kind) => {
+                if (!explorerStatus) return;
+                explorerStatus.textContent = msg || "";
+                explorerStatus.className = "explorer-status" + (kind ? " " + kind : "");
+            };
+
+            const updateButtons = () => {
+                if (!fileList) return;
+                const checkedBoxes = Array.from(fileList.querySelectorAll('input[type="checkbox"]:checked'));
+                if (mergeBtn) mergeBtn.disabled = checkedBoxes.length < 2;
+                if (mp3Btn) {
+                    // Enable only when every checked file has audio and isn't already MP3.
+                    const convertible = checkedBoxes.length >= 1 && checkedBoxes.every((c) =>
+                        c.dataset.hasAudio === "1" && !c.value.toLowerCase().endsWith(".mp3"));
+                    mp3Btn.disabled = !convertible;
+                }
+            };
+
+            const loadFiles = async () => {
+                if (!fileList) return;
+                try {
+                    const res = await fetch("/files", { headers: { "X-Requested-With": "fetch" } });
+                    const data = await res.json();
+                    const files = data.files || [];
+                    fileList.innerHTML = "";
+                    if (files.length === 0) {
+                        fileList.innerHTML = '<p class="muted">No files yet. Download a video/audio stream above.</p>';
+                    } else {
+                        for (const f of files) {
+                            const row = document.createElement("div");
+                            row.className = "file-row";
+                            const id = "f_" + Math.random().toString(36).slice(2);
+                            const cb = document.createElement("input");
+                            cb.type = "checkbox"; cb.id = id; cb.value = f.name;
+                            cb.dataset.hasAudio = f.hasAudio ? "1" : "0";
+                            cb.addEventListener("change", updateButtons);
+                            const label = document.createElement("label");
+                            label.htmlFor = id;
+                            const typeSpan = document.createElement("span");
+                            typeSpan.className = "file-type " + (f.type || "other");
+                            typeSpan.textContent = f.type || "other";
+                            const nameSpan = document.createElement("span");
+                            nameSpan.className = "file-name";
+                            nameSpan.textContent = f.name;
+                            label.appendChild(typeSpan);
+                            label.appendChild(nameSpan);
+                            const sizeSpan = document.createElement("span");
+                            sizeSpan.className = "file-size";
+                            sizeSpan.textContent = formatSize(f.size);
+                            row.appendChild(cb);
+                            row.appendChild(label);
+                            row.appendChild(sizeSpan);
+                            fileList.appendChild(row);
+                        }
+                    }
+                    updateButtons();
+                } catch (err) {
+                    setStatus("Could not load files: " + (err.message || err), "error");
+                }
+            };
+
+            if (refreshBtn) refreshBtn.addEventListener("click", loadFiles);
+
+            const openFolder = document.getElementById("open-folder");
+            const openFolderInExplorer = async () => {
+                try {
+                    const res = await fetch("/open-folder", { headers: { "X-Requested-With": "fetch" } });
+                    const data = await res.json();
+                    if (data.status !== "ok") setStatus(data.message || "Could not open folder.", "error");
+                } catch (err) {
+                    setStatus("Could not open folder: " + (err.message || err), "error");
+                }
+            };
+            if (openFolder) {
+                openFolder.addEventListener("click", openFolderInExplorer);
+                openFolder.addEventListener("keydown", (e) => {
+                    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openFolderInExplorer(); }
+                });
+            }
+
+            if (mergeBtn) {
+                mergeBtn.addEventListener("click", async () => {
+                    const selected = Array.from(fileList.querySelectorAll('input[type="checkbox"]:checked')).map((c) => c.value);
+                    if (selected.length < 2) return;
+                    const params = new URLSearchParams();
+                    selected.forEach((name) => params.append("files", name));
+                    mergeBtn.disabled = true;
+                    setStatus("Re-encoding to H.264/AAC MP4 for Telegram/Android/iPhone — this can take a while…");
+                    try {
+                        const res = await fetch("/merge?" + params.toString(), { headers: { "X-Requested-With": "fetch" } });
+                        const data = await res.json();
+                        if (data.status === "ok") {
+                            setStatus(data.message || "Merged.", "success");
+                            await loadFiles();
+                        } else {
+                            setStatus(data.message || "Merge failed.", "error");
+                            updateButtons();
+                        }
+                    } catch (err) {
+                        setStatus("Merge failed: " + (err.message || err), "error");
+                        updateButtons();
+                    }
+                });
+            }
+
+            if (mp3Btn) {
+                mp3Btn.addEventListener("click", async () => {
+                    const selected = selectedNames();
+                    if (selected.length < 1) return;
+                    const params = new URLSearchParams();
+                    selected.forEach((name) => params.append("files", name));
+                    mp3Btn.disabled = true;
+                    setStatus("Converting to MP3 (192 kbps)…");
+                    try {
+                        const res = await fetch("/to-mp3?" + params.toString(), { headers: { "X-Requested-With": "fetch" } });
+                        const data = await res.json();
+                        if (data.status === "ok") {
+                            setStatus(data.message || "Converted.", "success");
+                            await loadFiles();
+                        } else {
+                            setStatus(data.message || "Conversion failed.", "error");
+                            updateButtons();
+                        }
+                    } catch (err) {
+                        setStatus("Conversion failed: " + (err.message || err), "error");
+                        updateButtons();
+                    }
+                });
+            }
+
+            loadFiles();
+            document.querySelectorAll('input[name="format-filter"]').forEach((radio) => {
+                radio.addEventListener("change", () => {
+                    const value = radio.value;
+                    document.querySelectorAll(".format-card[data-stream-type]").forEach((card) => {
+                        const type = card.dataset.streamType;
+                        const show = value === "all" || type === value;
+                        card.dataset.hidden = show ? "false" : "true";
+                    });
+                });
+            });
+            document.querySelectorAll(".format-card[data-endpoint]").forEach((card) => {
+                card.addEventListener("click", async (e) => {
+                    e.preventDefault();
+                    if (card.classList.contains("loading")) return;
+                    const endpoint = card.dataset.endpoint;
+                    if (!endpoint) return;
+                    const statusEl = card.querySelector(".format-status");
+                    card.classList.remove("success", "error"); card.classList.add("loading");
+                    if (statusEl) statusEl.textContent = "Starting download…";
+                    try {
+                        const res = await fetch(endpoint, { headers: { "X-Requested-With": "fetch" } });
+                        const text = await res.text();
+                        let data; try { data = JSON.parse(text); } catch { throw new Error(text || "Unexpected response"); }
+                        if (!res.ok || data.status !== "started") throw new Error(data.message || "Unable to start download");
+                        const trackResult = await (async () => {
+                            for (;;) {
+                                const r = await fetch("/download/status?id=" + encodeURIComponent(data.jobId), { headers: { "X-Requested-With": "fetch" } });
+                                const t = await r.text();
+                                let d; try { d = JSON.parse(t); } catch { throw new Error(t); }
+                                if (!r.ok) throw new Error(d.message || "Progress failed");
+                                if (statusEl) {
+                                    if (d.status === "running") statusEl.textContent = "Downloading… " + (d.percent || 0) + "%";
+                                    else if (d.status === "completed") statusEl.textContent = d.message || "Saved";
+                                    else if (d.status === "failed") statusEl.textContent = d.error || "Failed";
+                                }
+                                if (d.status === "completed") return { success: true, message: d.message };
+                                if (d.status === "failed") return { success: false, error: d.error || "Failed" };
+                                await delay(600);
+                            }
+                        })();
+                        card.classList.remove("loading");
+                        if (trackResult.success) { card.classList.add("success"); if (statusEl) statusEl.textContent = trackResult.message || "Saved"; }
+                        else { card.classList.add("error"); if (statusEl) statusEl.textContent = trackResult.error || "Failed"; }
+                    } catch (err) {
+                        card.classList.remove("loading"); card.classList.add("error");
+                        if (statusEl) statusEl.textContent = err.message || "Failed";
+                    }
+                });
+            });
+        });
+    </script>
+</body>
+</html>

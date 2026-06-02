@@ -1,7 +1,7 @@
 //! HTTP server for the standalone downloader: check video, list formats, download by itag.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use downloader::{ensure_ytdlp_available, StreamInfo, YoutubeDownloader};
@@ -11,11 +11,26 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use url::form_urlencoded;
 
 const TEMPLATE: &str = include_str!("index.html");
 const MAX_REQUEST_SIZE: usize = 8192;
+
+/// File explorer markup, rendered under the video card on the results page.
+const EXPLORER_HTML: &str = r#"<div class="explorer" id="explorer">
+    <div class="explorer-head">
+        <h3 id="open-folder" title="Open this folder in your file explorer" role="button" tabindex="0">📂 downloaded/</h3>
+        <div class="explorer-actions">
+            <button type="button" id="refresh-files" class="btn-secondary">Refresh</button>
+            <button type="button" id="mp3-btn" disabled>&rarr; MP3</button>
+            <button type="button" id="merge-btn" disabled>Merge &rarr; MP4 (phones)</button>
+        </div>
+    </div>
+    <div class="explorer-status" id="explorer-status"></div>
+    <div class="file-list" id="file-list"></div>
+</div>"#;
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
 static DOWNLOAD_JOBS: Lazy<Arc<Mutex<HashMap<String, DownloadJobState>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
@@ -111,6 +126,18 @@ async fn parse_and_handle_request(
         None => (target, None),
     };
 
+    if path == "/files" {
+        return handle_list_files().await;
+    }
+    if path == "/open-folder" {
+        return handle_open_folder().await;
+    }
+    if path == "/merge" {
+        return handle_merge(query).await;
+    }
+    if path == "/to-mp3" {
+        return handle_to_mp3(query).await;
+    }
     if path == "/download/status" {
         return handle_download_status(query).await;
     }
@@ -349,6 +376,421 @@ async fn handle_download_status(query: Option<&str>) -> (String, String, String,
     )
 }
 
+/// Folder where downloads and merged files live.
+fn downloaded_dir() -> PathBuf {
+    PathBuf::from("downloaded")
+}
+
+/// Classify a file by extension for display in the explorer.
+fn classify_ext(ext: &str) -> &'static str {
+    match ext.to_lowercase().as_str() {
+        "mp3" | "m4a" | "aac" | "opus" | "ogg" | "oga" | "wav" | "weba" | "flac" => "audio",
+        "mp4" | "webm" | "mkv" | "mov" | "avi" | "flv" | "m4v" | "ts" => "video",
+        _ => "other",
+    }
+}
+
+/// Reject names that could escape the downloaded/ folder.
+fn is_safe_filename(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !name.contains('\0')
+}
+
+/// Build the standard JSON-error response tuple used by /files and /merge.
+fn json_error(message: &str) -> (String, String, String, Option<PathBuf>) {
+    (
+        "200 OK".to_string(),
+        json!({ "status": "error", "message": message }).to_string(),
+        "application/json".to_string(),
+        None,
+    )
+}
+
+/// List the files in downloaded/ as JSON for the web explorer. Probes the actual
+/// streams so audio-only `.webm` (e.g. itag251 opus) reports as audio, not video,
+/// and the UI can tell which files carry audio.
+async fn handle_list_files() -> (String, String, String, Option<PathBuf>) {
+    let dir = downloaded_dir();
+    let ffprobe = resolve_ffprobe();
+    let mut files: Vec<serde_json::Value> = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+            let (has_video, has_audio) = probe_streams(&ffprobe, &path).await;
+            let kind = if has_video {
+                "video"
+            } else if has_audio {
+                "audio"
+            } else {
+                "other"
+            };
+            files.push(json!({
+                "name": name,
+                "size": size,
+                "type": kind,
+                "hasAudio": has_audio,
+                "hasVideo": has_video,
+            }));
+        }
+    }
+    files.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
+    });
+    (
+        "200 OK".to_string(),
+        json!({ "files": files }).to_string(),
+        "application/json".to_string(),
+        None,
+    )
+}
+
+/// Open the downloaded/ folder in the OS file explorer.
+async fn handle_open_folder() -> (String, String, String, Option<PathBuf>) {
+    let dir = downloaded_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return json_error(&format!("Could not create folder: {}", e));
+    }
+    let abs = std::fs::canonicalize(&dir).unwrap_or(dir);
+    // Windows canonicalize yields a \\?\ prefix that explorer.exe rejects.
+    let path_str = abs.to_string_lossy().to_string();
+    let cleaned = path_str
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&path_str)
+        .to_string();
+
+    #[cfg(target_os = "windows")]
+    let spawned = Command::new("explorer").arg(&cleaned).spawn();
+    #[cfg(target_os = "macos")]
+    let spawned = Command::new("open").arg(&cleaned).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let spawned = Command::new("xdg-open").arg(&cleaned).spawn();
+
+    match spawned {
+        Ok(_) => (
+            "200 OK".to_string(),
+            json!({ "status": "ok", "path": cleaned }).to_string(),
+            "application/json".to_string(),
+            None,
+        ),
+        Err(e) => json_error(&format!("Could not open folder: {}", e)),
+    }
+}
+
+/// Locate a tool: prefer a local copy (cwd or next to the binary), else rely on PATH.
+fn resolve_tool(names: &[&str], fallback: &str) -> PathBuf {
+    if let Ok(cwd) = std::env::current_dir() {
+        for n in names {
+            let c = cwd.join(n);
+            if c.is_file() {
+                return c;
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for n in names {
+                let c = parent.join(n);
+                if c.is_file() {
+                    return c;
+                }
+            }
+        }
+    }
+    PathBuf::from(fallback)
+}
+
+fn resolve_ffmpeg() -> PathBuf {
+    resolve_tool(&["ffmpeg.exe", "ffmpeg"], "ffmpeg")
+}
+
+fn resolve_ffprobe() -> PathBuf {
+    resolve_tool(&["ffprobe.exe", "ffprobe"], "ffprobe")
+}
+
+/// Probe a file for which stream kinds it carries: (has_video, has_audio).
+/// Falls back to an extension guess if ffprobe is unavailable.
+async fn probe_streams(ffprobe: &Path, path: &Path) -> (bool, bool) {
+    let mut command = Command::new(ffprobe);
+    command
+        .args(["-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0"])
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    match command.output().await {
+        Ok(out) => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            let has_video = s.lines().any(|l| l.trim() == "video");
+            let has_audio = s.lines().any(|l| l.trim() == "audio");
+            (has_video, has_audio)
+        }
+        Err(_) => {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            match classify_ext(ext) {
+                "video" => (true, false),
+                "audio" => (false, true),
+                _ => (false, false),
+            }
+        }
+    }
+}
+
+/// Derive a base name for the merged output from the first selected file.
+fn derive_merge_base(files: &[String]) -> String {
+    let first = files.first().map(|s| s.as_str()).unwrap_or("merged");
+    let stem = first.rsplit_once('.').map(|(s, _)| s).unwrap_or(first);
+    let base = stem.split("_itag").next().unwrap_or(stem);
+    if base.is_empty() {
+        "merged".to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+/// Merge selected video + audio files with ffmpeg (stream copy) into downloaded/.
+async fn handle_merge(query: Option<&str>) -> (String, String, String, Option<PathBuf>) {
+    let Some(q) = query else {
+        return json_error("Missing files");
+    };
+
+    let mut files: Vec<String> = Vec::new();
+    for (key, value) in form_urlencoded::parse(q.as_bytes()) {
+        if key == "files" {
+            let v = value.into_owned();
+            if !v.is_empty() {
+                files.push(v);
+            }
+        }
+    }
+
+    if files.len() < 2 {
+        return json_error("Select at least two files (one video and one audio) to merge.");
+    }
+
+    let dir = downloaded_dir();
+    let mut input_paths: Vec<PathBuf> = Vec::new();
+    for name in &files {
+        if !is_safe_filename(name) {
+            return json_error(&format!("Invalid file name: {}", name));
+        }
+        let path = dir.join(name);
+        if !path.is_file() {
+            return json_error(&format!("File not found: {}", name));
+        }
+        input_paths.push(path);
+    }
+
+    // Detect which selected file carries video and which carries audio, so the
+    // user can tick them in any order (extensions like .webm are ambiguous).
+    let ffprobe = resolve_ffprobe();
+    let mut video_input: Option<PathBuf> = None;
+    let mut audio_input: Option<PathBuf> = None;
+    for path in &input_paths {
+        let (has_video, has_audio) = probe_streams(&ffprobe, path).await;
+        if has_video && video_input.is_none() {
+            video_input = Some(path.clone());
+            continue;
+        }
+        if has_audio && audio_input.is_none() {
+            audio_input = Some(path.clone());
+        }
+    }
+    // If audio is still missing (e.g. the only audio lives inside a muxed file
+    // we already claimed for video), reuse any other file that has audio.
+    if audio_input.is_none() {
+        for path in &input_paths {
+            if Some(path) == video_input.as_ref() {
+                continue;
+            }
+            let (_, has_audio) = probe_streams(&ffprobe, path).await;
+            if has_audio {
+                audio_input = Some(path.clone());
+                break;
+            }
+        }
+    }
+
+    let (Some(video_input), Some(audio_input)) = (video_input, audio_input) else {
+        return json_error(
+            "Select one file that has video and one that has audio (e.g. an itag137 .mp4 video and an itag251 .webm audio).",
+        );
+    };
+
+    let out_name = format!("{}_telegram.mp4", derive_merge_base(&files));
+    let out_path = dir.join(&out_name);
+
+    // Re-encode to H.264 High / yuv420p + AAC with faststart — the broadly
+    // compatible combo for Telegram, Android and iPhone playback.
+    let ffmpeg = resolve_ffmpeg();
+    let mut command = Command::new(&ffmpeg);
+    command
+        .arg("-y")
+        .arg("-i")
+        .arg(&video_input)
+        .arg("-i")
+        .arg(&audio_input)
+        .arg("-map")
+        .arg("0:v:0")
+        .arg("-map")
+        .arg("1:a:0")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-profile:v")
+        .arg("high")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-crf")
+        .arg("23")
+        .arg("-preset")
+        .arg("fast")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("128k")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(&out_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let output = match command.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            return json_error(&format!(
+                "Could not run ffmpeg ({}): {}. Install FFmpeg and add it to PATH, or place ffmpeg.exe next to downloader.exe.",
+                ffmpeg.display(),
+                e
+            ));
+        }
+    };
+
+    if !output.status.success() {
+        return json_error(&format!("ffmpeg failed: {}", ffmpeg_stderr_tail(&output.stderr)));
+    }
+
+    (
+        "200 OK".to_string(),
+        json!({
+            "status": "ok",
+            "output": out_name,
+            "message": format!("Merged into {}", out_name),
+        })
+        .to_string(),
+        "application/json".to_string(),
+        None,
+    )
+}
+
+/// Last few non-empty lines of ffmpeg stderr, for surfacing failures.
+fn ffmpeg_stderr_tail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines
+        .iter()
+        .rev()
+        .take(6)
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Convert each selected file (that has audio) to a 192 kbps MP3 in downloaded/.
+async fn handle_to_mp3(query: Option<&str>) -> (String, String, String, Option<PathBuf>) {
+    let Some(q) = query else {
+        return json_error("Missing files");
+    };
+
+    let mut files: Vec<String> = Vec::new();
+    for (key, value) in form_urlencoded::parse(q.as_bytes()) {
+        if key == "files" {
+            let v = value.into_owned();
+            if !v.is_empty() {
+                files.push(v);
+            }
+        }
+    }
+    if files.is_empty() {
+        return json_error("Select at least one file to convert to MP3.");
+    }
+
+    let dir = downloaded_dir();
+    let ffmpeg = resolve_ffmpeg();
+    let ffprobe = resolve_ffprobe();
+    let mut outputs: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for name in &files {
+        if !is_safe_filename(name) {
+            errors.push(format!("{}: invalid name", name));
+            continue;
+        }
+        if name.to_lowercase().ends_with(".mp3") {
+            errors.push(format!("{}: already MP3", name));
+            continue;
+        }
+        let path = dir.join(name);
+        if !path.is_file() {
+            errors.push(format!("{}: not found", name));
+            continue;
+        }
+        let (_, has_audio) = probe_streams(&ffprobe, &path).await;
+        if !has_audio {
+            errors.push(format!("{}: no audio stream", name));
+            continue;
+        }
+
+        let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+        let out_name = format!("{}.mp3", stem);
+        let out_path = dir.join(&out_name);
+
+        let mut command = Command::new(&ffmpeg);
+        command
+            .arg("-y")
+            .arg("-i")
+            .arg(&path)
+            .arg("-vn")
+            .arg("-c:a")
+            .arg("libmp3lame")
+            .arg("-b:a")
+            .arg("192k")
+            .arg(&out_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        match command.output().await {
+            Ok(out) if out.status.success() => outputs.push(out_name),
+            Ok(out) => errors.push(format!("{}: {}", name, ffmpeg_stderr_tail(&out.stderr))),
+            Err(e) => errors.push(format!("{}: could not run ffmpeg ({}): {}", name, ffmpeg.display(), e)),
+        }
+    }
+
+    if outputs.is_empty() {
+        return json_error(&format!("No files converted. {}", errors.join(" | ")));
+    }
+
+    let mut message = format!("Converted to MP3: {}", outputs.join(", "));
+    if !errors.is_empty() {
+        message.push_str(&format!(" — skipped: {}", errors.join(" | ")));
+    }
+    (
+        "200 OK".to_string(),
+        json!({ "status": "ok", "outputs": outputs, "message": message }).to_string(),
+        "application/json".to_string(),
+        None,
+    )
+}
+
 fn render_page(
     input_value: &str,
     video_info: Option<&VideoInfo>,
@@ -369,6 +811,8 @@ fn render_page(
             r#"<div class="placeholder">Paste a YouTube URL or 11-character video ID above and click “Check video”.</div>"#,
         );
     }
+    // Always show the downloaded/ file explorer — on the start page and under the card.
+    result.push_str(EXPLORER_HTML);
     TEMPLATE
         .replace("{{ESCAPED_INPUT}}", &escaped)
         .replace("{{RESULT_SECTION}}", &result)
@@ -410,7 +854,7 @@ fn render_video_info(
         format!(r#"<div><a href="{video_url}" target="_blank" rel="noopener"><img src="{thumb}" alt="Thumbnail" loading="lazy" /></a></div>"#)
     };
     format!(
-        r#"<div class="card">{thumb_html}<div class="meta"><h2><a href="{video_url}" target="_blank" rel="noopener">{title}</a></h2><div class="stats"><span>👤 {channel}</span><span>⏱ {duration}</span><span>👁 {views} views</span><span>📅 {publish_date}</span></div></div><div class="links">{format_html}</div></div>"#
+        r#"<div class="card"><div class="card-head">{thumb_html}<div class="meta"><h2><a href="{video_url}" target="_blank" rel="noopener">{title}</a></h2><div class="stats"><span>👤 {channel}</span><span>⏱ {duration}</span><span>👁 {views} views</span><span>📅 {publish_date}</span></div></div></div><div class="links">{format_html}</div></div>"#
     )
 }
 
@@ -458,12 +902,25 @@ fn render_format_list_streams(streams: &[StreamInfo], video_url: &str, video_id:
     format!(r#"<div class="format-list"><h3>Available formats</h3>{filter_radios}<div class="format-grid">{cards}</div></div>"#)
 }
 
+/// Render one format as a single compact line: itag | quality | codecs | bitrate.
+fn render_line_card(
+    itag: u64,
+    quality: &str,
+    codecs: &str,
+    bitrate: &str,
+    endpoint: &str,
+    data_type: &str,
+) -> String {
+    format!(
+        r##"<a class="format-card" href="#" role="button" data-endpoint="{endpoint}" data-itag="{itag}" data-stream-type="{data_type}"><span class="format-itag">{itag}</span><span class="format-sep">|</span><span class="format-quality">{quality}</span><span class="format-sep">|</span><span class="format-codecs">{codecs}</span><span class="format-sep">|</span><span class="format-meta">{bitrate}</span><span class="format-status"></span></a>"##
+    )
+}
+
 fn render_format_card_stream(s: &StreamInfo, video_url: &str, video_id: &str) -> String {
     let itag = s.itag.unwrap_or(0);
-    let badge = html_escape(&format!("itag {}", itag));
     let quality = html_escape(&s.quality);
-    let codecs = html_escape(&s.stream_type);
-    let meta = html_escape(&format!("{} · {}", s.container, format_bitrate(s.bitrate)));
+    let codecs = html_escape(&s.container);
+    let bitrate = html_escape(&format_bitrate(s.bitrate));
     let query = form_urlencoded::Serializer::new(String::new())
         .append_pair("video", video_url)
         .append_pair("itag", &itag.to_string())
@@ -473,9 +930,7 @@ fn render_format_card_stream(s: &StreamInfo, video_url: &str, video_id: &str) ->
     let endpoint = html_escape(&format!("/download?{query}"));
     let stream_type = s.stream_type.to_lowercase();
     let data_type = if stream_type == "muxed" { "muxed" } else if stream_type == "video" { "video" } else { "audio" };
-    format!(
-        r##"<a class="format-card" href="#" role="button" data-endpoint="{endpoint}" data-itag="{itag}" data-stream-type="{data_type}"><span class="format-badge">{badge}</span><span class="format-quality">{quality}</span><span class="format-codecs">{codecs}</span><span class="format-meta">{meta}</span><span class="format-note">Server download</span><span class="format-status"></span></a>"##
-    )
+    render_line_card(itag, &quality, &codecs, &bitrate, &endpoint, data_type)
 }
 
 fn render_format_list(formats: &[VideoFormat], video_url: &str) -> String {
@@ -497,25 +952,21 @@ fn render_format_list(formats: &[VideoFormat], video_url: &str) -> String {
 }
 
 fn render_format_card(fmt: &VideoFormat, video_url: &str) -> String {
-    let badge = html_escape(&format!("itag {}", fmt.itag));
     let quality = html_escape(&format_quality(fmt));
     let codecs = html_escape(&format_codecs(fmt));
-    let meta = html_escape(&format_format_meta(fmt));
+    let bitrate = html_escape(&format_bitrate(fmt.bitrate));
     let query = form_urlencoded::Serializer::new(String::new())
         .append_pair("video", video_url)
         .append_pair("itag", &fmt.itag.to_string())
         .finish();
     let endpoint = html_escape(&format!("/download?{query}"));
-    let stream_type = match (fmt.has_video, fmt.has_audio) {
+    let data_type = match (fmt.has_video, fmt.has_audio) {
         (true, true) => "muxed",
         (true, false) => "video",
         (false, true) => "audio",
         _ => "unknown",
     };
-    format!(
-        r##"<a class="format-card" href="#" role="button" data-endpoint="{endpoint}" data-itag="{}" data-stream-type="{stream_type}"><span class="format-badge">{badge}</span><span class="format-quality">{quality}</span><span class="format-codecs">{codecs}</span><span class="format-meta">{meta}</span><span class="format-note">Server download</span><span class="format-status"></span></a>"##,
-        fmt.itag
-    )
+    render_line_card(fmt.itag, &quality, &codecs, &bitrate, &endpoint, data_type)
 }
 
 fn format_quality(fmt: &VideoFormat) -> String {
@@ -535,16 +986,6 @@ fn format_quality(fmt: &VideoFormat) -> String {
         }
     }
     fmt.mime_type.container.to_uppercase()
-}
-
-fn format_format_meta(fmt: &VideoFormat) -> String {
-    let t = match (fmt.has_video, fmt.has_audio) {
-        (true, true) => "Video + Audio",
-        (true, false) => "Video only",
-        (false, true) => "Audio only",
-        _ => "Data",
-    };
-    format!("{} · {}", t, format_bitrate(fmt.bitrate))
 }
 
 fn format_codecs(fmt: &VideoFormat) -> String {
