@@ -9,7 +9,7 @@ use once_cell::sync::Lazy;
 use rusty_ytdl::{VideoFormat, VideoInfo};
 use serde_json::json;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -423,7 +423,15 @@ async fn handle_list_files() -> (String, String, String, Option<PathBuf>) {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+            let meta = entry.metadata().await.ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            // Unix-seconds mtime so the UI can highlight the most recent downloads.
+            let modified = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             let (has_video, has_audio) = probe_streams(&ffprobe, &path).await;
             let kind = if has_video {
                 "video"
@@ -435,6 +443,7 @@ async fn handle_list_files() -> (String, String, String, Option<PathBuf>) {
             files.push(json!({
                 "name": name,
                 "size": size,
+                "modified": modified,
                 "type": kind,
                 "hasAudio": has_audio,
                 "hasVideo": has_video,
@@ -629,66 +638,169 @@ async fn handle_merge(query: Option<&str>) -> (String, String, String, Option<Pa
     let out_name = format!("{}_telegram.mp4", derive_merge_base(&files));
     let out_path = dir.join(&out_name);
 
-    // Re-encode to H.264 High / yuv420p + AAC with faststart — the broadly
-    // compatible combo for Telegram, Android and iPhone playback.
-    let ffmpeg = resolve_ffmpeg();
-    let mut command = Command::new(&ffmpeg);
-    command
-        .arg("-y")
-        .arg("-i")
-        .arg(&video_input)
-        .arg("-i")
-        .arg(&audio_input)
-        .arg("-map")
-        .arg("0:v:0")
-        .arg("-map")
-        .arg("1:a:0")
-        .arg("-c:v")
-        .arg("libx264")
-        .arg("-profile:v")
-        .arg("high")
-        .arg("-pix_fmt")
-        .arg("yuv420p")
-        .arg("-crf")
-        .arg("23")
-        .arg("-preset")
-        .arg("fast")
-        .arg("-c:a")
-        .arg("aac")
-        .arg("-b:a")
-        .arg("128k")
-        .arg("-movflags")
-        .arg("+faststart")
-        .arg(&out_path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    // Probe the source duration up front so ffmpeg's time-based progress can be
+    // turned into a percentage while it runs.
+    let duration = probe_duration(&ffprobe, &video_input).await;
 
-    let output = match command.output().await {
-        Ok(o) => o,
-        Err(e) => {
-            return json_error(&format!(
-                "Could not run ffmpeg ({}): {}. Install FFmpeg and add it to PATH, or place ffmpeg.exe next to downloader.exe.",
-                ffmpeg.display(),
-                e
-            ));
-        }
-    };
-
-    if !output.status.success() {
-        return json_error(&format!("ffmpeg failed: {}", ffmpeg_stderr_tail(&output.stderr)));
+    // Run ffmpeg as a background job (same status map as downloads) so the UI can
+    // poll /download/status and show a real progress bar instead of a frozen wait.
+    let job_id = format!("{:016x}", JOB_COUNTER.fetch_add(1, Ordering::Relaxed));
+    {
+        let mut jobs = DOWNLOAD_JOBS.lock().await;
+        jobs.insert(
+            job_id.clone(),
+            DownloadJobState {
+                percent: 0,
+                status: DownloadJobStatus::Running,
+                message: None,
+                path: None,
+                error: None,
+            },
+        );
     }
+
+    let jobs_handle = DOWNLOAD_JOBS.clone();
+    let job_id_task = job_id.clone();
+    let ffmpeg = resolve_ffmpeg();
+    let out_name_task = out_name.clone();
+
+    tokio::spawn(async move {
+        // Re-encode to H.264 High / yuv420p + AAC with faststart — the broadly
+        // compatible combo for Telegram, Android and iPhone playback. `-progress
+        // pipe:1` streams machine-readable progress lines (out_time=…) to stdout.
+        let mut command = Command::new(&ffmpeg);
+        command
+            .arg("-y")
+            .arg("-i").arg(&video_input)
+            .arg("-i").arg(&audio_input)
+            .arg("-map").arg("0:v:0")
+            .arg("-map").arg("1:a:0")
+            .arg("-c:v").arg("libx264")
+            .arg("-profile:v").arg("high")
+            .arg("-pix_fmt").arg("yuv420p")
+            .arg("-crf").arg("23")
+            .arg("-preset").arg("fast")
+            .arg("-c:a").arg("aac")
+            .arg("-b:a").arg("128k")
+            .arg("-movflags").arg("+faststart")
+            .arg("-progress").arg("pipe:1")
+            .arg("-nostats")
+            .arg(&out_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                set_job_failed(&jobs_handle, &job_id_task, format!(
+                    "Could not run ffmpeg ({}): {}. Install FFmpeg and add it to PATH, or place ffmpeg.exe next to downloader.exe.",
+                    ffmpeg.display(), e,
+                )).await;
+                return;
+            }
+        };
+
+        let Some(stdout) = child.stdout.take() else {
+            set_job_failed(&jobs_handle, &job_id_task, "ffmpeg: missing stdout".to_string()).await;
+            return;
+        };
+        let stderr = child.stderr.take();
+        // Drain stderr in the background so we keep it for the error message.
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            if let Some(mut s) = stderr {
+                let _ = s.read_to_end(&mut buf).await;
+            }
+            buf
+        });
+
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if let Some(rest) = line.trim().strip_prefix("out_time=") {
+                if let (Some(total), Some(secs)) = (duration, parse_ffmpeg_time(rest)) {
+                    if total > 0.0 {
+                        // Cap below 100 so the bar only completes once ffmpeg exits.
+                        let pct = ((secs / total) * 100.0).clamp(0.0, 99.0) as u8;
+                        let mut jobs = jobs_handle.lock().await;
+                        if let Some(s) = jobs.get_mut(&job_id_task) {
+                            s.percent = pct;
+                        }
+                    }
+                }
+            }
+        }
+
+        let status = child.wait().await;
+        let stderr_bytes = stderr_task.await.unwrap_or_default();
+
+        let mut jobs = jobs_handle.lock().await;
+        if let Some(s) = jobs.get_mut(&job_id_task) {
+            match status {
+                Ok(st) if st.success() => {
+                    s.percent = 100;
+                    s.status = DownloadJobStatus::Completed;
+                    s.path = Some(out_name_task.clone());
+                    s.message = Some(format!("Merged into {}", out_name_task));
+                }
+                Ok(_) => {
+                    s.status = DownloadJobStatus::Failed;
+                    s.error = Some(format!("ffmpeg failed: {}", ffmpeg_stderr_tail(&stderr_bytes)));
+                }
+                Err(e) => {
+                    s.status = DownloadJobStatus::Failed;
+                    s.error = Some(format!("ffmpeg wait failed: {}", e));
+                }
+            }
+        }
+    });
 
     (
         "200 OK".to_string(),
-        json!({
-            "status": "ok",
-            "output": out_name,
-            "message": format!("Merged into {}", out_name),
-        })
-        .to_string(),
+        json!({ "status": "started", "jobId": job_id }).to_string(),
         "application/json".to_string(),
         None,
     )
+}
+
+/// Mark a job as failed with an error message.
+async fn set_job_failed(
+    jobs: &Arc<Mutex<HashMap<String, DownloadJobState>>>,
+    id: &str,
+    msg: String,
+) {
+    let mut g = jobs.lock().await;
+    if let Some(s) = g.get_mut(id) {
+        s.status = DownloadJobStatus::Failed;
+        s.error = Some(msg);
+    }
+}
+
+/// Parse an ffmpeg `out_time` value (`HH:MM:SS.micro`) into seconds.
+fn parse_ffmpeg_time(s: &str) -> Option<f64> {
+    let mut it = s.trim().split(':');
+    let h: f64 = it.next()?.trim().parse().ok()?;
+    let m: f64 = it.next()?.trim().parse().ok()?;
+    let sec: f64 = it.next()?.trim().parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + sec)
+}
+
+/// Total duration of a media file in seconds, via ffprobe (None if unavailable).
+async fn probe_duration(ffprobe: &Path, path: &Path) -> Option<f64> {
+    let out = Command::new(ffprobe)
+        .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+        .arg(path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().ok()
 }
 
 /// Last few non-empty lines of ffmpeg stderr, for surfacing failures.
@@ -865,6 +977,7 @@ fn render_format_filter_radios() -> String {
         <label><input type="radio" name="format-filter" value="video"> V</label>
         <label><input type="radio" name="format-filter" value="audio"> A</label>
         <label><input type="radio" name="format-filter" value="muxed"> V & A</label>
+        <button type="button" id="combo-best" class="combo-btn" title="Download itag 137 (1080p video) + 251 (audio), then merge into a phone-ready MP4"><span class="combo-fill"></span><span class="combo-label">⬇ 1080p + 🎵 → MP4</span></button>
     </div>"#.to_string()
 }
 

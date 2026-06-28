@@ -49,6 +49,22 @@
         .format-filter-label { font-size: 0.9rem; font-weight: 500; color: rgba(226, 232, 240, 0.85); margin-right: 0.25rem; }
         .format-filter label { display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer; font-size: 0.9rem; color: rgba(226, 232, 240, 0.9); }
         .format-filter input[type="radio"] { accent-color: #38bdf8; cursor: pointer; }
+        .combo-btn {
+            position: relative; isolation: isolate; overflow: hidden;
+            margin-left: auto; padding: 0.45rem 0.9rem; font-size: 0.85rem; font-weight: 600;
+            background: #0f172a; color: #f8fafc; border: 1px solid rgba(248, 250, 252, 0.6);
+        }
+        .combo-btn:hover { transform: none; box-shadow: none; }
+        /* The fill sweeps left→right; the label inverts over it via blend mode. */
+        .combo-btn .combo-fill {
+            position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
+            background: #f8fafc; z-index: 0; transition: width 0.25s ease;
+        }
+        .combo-btn .combo-label {
+            position: relative; z-index: 1; mix-blend-mode: difference; color: #fff;
+            display: inline-block; white-space: nowrap;
+        }
+        .combo-btn.unavailable { opacity: 0.45; cursor: not-allowed; }
         .format-card[data-hidden="true"] { display: none; }
         .format-grid { display: grid; gap: 0.4rem; }
         .format-card {
@@ -97,6 +113,18 @@
         .file-row {
             display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 0.85rem;
             background: rgba(30, 41, 59, 0.6); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 0.7rem;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+        /* Two most recently downloaded files get a bright amber highlight. */
+        .file-row.recent {
+            border-color: #fbbf24;
+            box-shadow: 0 0 0 1px #fbbf24, 0 0 16px rgba(251, 191, 36, 0.5);
+        }
+        .file-row.recent .file-name { color: #fde68a; font-weight: 600; }
+        .file-badge-new {
+            flex: 0 0 auto; font-size: 0.62rem; text-transform: uppercase; font-weight: 700;
+            letter-spacing: 0.05em; padding: 0.15rem 0.45rem; border-radius: 999px;
+            background: #fbbf24; color: #0f172a;
         }
         .file-row input[type="checkbox"] {
             appearance: none; -webkit-appearance: none; margin: 0; flex: 0 0 auto; cursor: pointer;
@@ -181,13 +209,26 @@
                     const res = await fetch("/files", { headers: { "X-Requested-With": "fetch" } });
                     const data = await res.json();
                     const files = data.files || [];
+                    // Newest downloads first; ties fall back to name so order stays stable.
+                    files.sort((a, b) =>
+                        (b.modified || 0) - (a.modified || 0) || a.name.localeCompare(b.name));
                     fileList.innerHTML = "";
                     if (files.length === 0) {
                         fileList.innerHTML = '<p class="muted">No files yet. Download a video/audio stream above.</p>';
                     } else {
+                        // The two files with the newest mtime are the latest downloads.
+                        const recentNames = new Set(
+                            [...files]
+                                .filter((f) => f.modified)
+                                .sort((a, b) => b.modified - a.modified)
+                                .slice(0, 2)
+                                .map((f) => f.name)
+                        );
                         for (const f of files) {
                             const row = document.createElement("div");
                             row.className = "file-row";
+                            const isRecent = recentNames.has(f.name);
+                            if (isRecent) row.classList.add("recent");
                             const id = "f_" + Math.random().toString(36).slice(2);
                             const cb = document.createElement("input");
                             cb.type = "checkbox"; cb.id = id; cb.value = f.name;
@@ -203,6 +244,12 @@
                             nameSpan.textContent = f.name;
                             label.appendChild(typeSpan);
                             label.appendChild(nameSpan);
+                            if (isRecent) {
+                                const newBadge = document.createElement("span");
+                                newBadge.className = "file-badge-new";
+                                newBadge.textContent = "new";
+                                label.appendChild(newBadge);
+                            }
                             const sizeSpan = document.createElement("span");
                             sizeSpan.className = "file-size";
                             sizeSpan.textContent = formatSize(f.size);
@@ -241,18 +288,16 @@
                 mergeBtn.addEventListener("click", async () => {
                     const selected = Array.from(fileList.querySelectorAll('input[type="checkbox"]:checked')).map((c) => c.value);
                     if (selected.length < 2) return;
-                    const params = new URLSearchParams();
-                    selected.forEach((name) => params.append("files", name));
                     mergeBtn.disabled = true;
-                    setStatus("Re-encoding to H.264/AAC MP4 for Telegram/Android/iPhone — this can take a while…");
+                    setStatus("Re-encoding to H.264/AAC MP4 for Telegram/Android/iPhone — 0%");
                     try {
-                        const res = await fetch("/merge?" + params.toString(), { headers: { "X-Requested-With": "fetch" } });
-                        const data = await res.json();
-                        if (data.status === "ok") {
-                            setStatus(data.message || "Merged.", "success");
+                        const m = await runMerge(selected, (p) =>
+                            setStatus("Re-encoding to H.264/AAC MP4 for Telegram/Android/iPhone — " + p + "%"));
+                        if (m.success) {
+                            setStatus(m.message || "Merged.", "success");
                             await loadFiles();
                         } else {
-                            setStatus(data.message || "Merge failed.", "error");
+                            setStatus(m.error || "Merge failed.", "error");
                             updateButtons();
                         }
                     } catch (err) {
@@ -298,6 +343,52 @@
                     });
                 });
             });
+            // Start a download for an endpoint and poll it to completion.
+            // Returns { success, message, error, path } — path is the saved file name.
+            const runDownload = async (endpoint, statusEl, onPercent) => {
+                const res = await fetch(endpoint, { headers: { "X-Requested-With": "fetch" } });
+                const text = await res.text();
+                let data; try { data = JSON.parse(text); } catch { throw new Error(text || "Unexpected response"); }
+                if (!res.ok || data.status !== "started") throw new Error(data.message || "Unable to start download");
+                for (;;) {
+                    const r = await fetch("/download/status?id=" + encodeURIComponent(data.jobId), { headers: { "X-Requested-With": "fetch" } });
+                    const t = await r.text();
+                    let d; try { d = JSON.parse(t); } catch { throw new Error(t); }
+                    if (!r.ok) throw new Error(d.message || "Progress failed");
+                    if (statusEl) {
+                        if (d.status === "running") statusEl.textContent = "Downloading… " + (d.percent || 0) + "%";
+                        else if (d.status === "completed") statusEl.textContent = d.message || "Saved";
+                        else if (d.status === "failed") statusEl.textContent = d.error || "Failed";
+                    }
+                    if (d.status === "running" && onPercent) onPercent(d.percent || 0);
+                    if (d.status === "completed") return { success: true, message: d.message, path: d.path };
+                    if (d.status === "failed") return { success: false, error: d.error || "Failed" };
+                    await delay(600);
+                }
+            };
+
+            // Start a merge job and poll it to completion. Returns { success, message, error, path }.
+            const runMerge = async (files, onPercent) => {
+                const params = new URLSearchParams();
+                files.forEach((name) => params.append("files", name));
+                const res = await fetch("/merge?" + params.toString(), { headers: { "X-Requested-With": "fetch" } });
+                const text = await res.text();
+                let data; try { data = JSON.parse(text); } catch { throw new Error(text || "Unexpected response"); }
+                if (data.status === "error") return { success: false, error: data.message || "Merge failed" };
+                if (data.status === "ok") return { success: true, message: data.message, path: data.output };
+                if (data.status !== "started") throw new Error(data.message || "Unable to start merge");
+                for (;;) {
+                    const r = await fetch("/download/status?id=" + encodeURIComponent(data.jobId), { headers: { "X-Requested-With": "fetch" } });
+                    const t = await r.text();
+                    let d; try { d = JSON.parse(t); } catch { throw new Error(t); }
+                    if (!r.ok) throw new Error(d.message || "Progress failed");
+                    if (d.status === "running" && onPercent) onPercent(d.percent || 0);
+                    if (d.status === "completed") return { success: true, message: d.message, path: d.path };
+                    if (d.status === "failed") return { success: false, error: d.error || "Merge failed" };
+                    await delay(600);
+                }
+            };
+
             document.querySelectorAll(".format-card[data-endpoint]").forEach((card) => {
                 card.addEventListener("click", async (e) => {
                     e.preventDefault();
@@ -308,35 +399,94 @@
                     card.classList.remove("success", "error"); card.classList.add("loading");
                     if (statusEl) statusEl.textContent = "Starting download…";
                     try {
-                        const res = await fetch(endpoint, { headers: { "X-Requested-With": "fetch" } });
-                        const text = await res.text();
-                        let data; try { data = JSON.parse(text); } catch { throw new Error(text || "Unexpected response"); }
-                        if (!res.ok || data.status !== "started") throw new Error(data.message || "Unable to start download");
-                        const trackResult = await (async () => {
-                            for (;;) {
-                                const r = await fetch("/download/status?id=" + encodeURIComponent(data.jobId), { headers: { "X-Requested-With": "fetch" } });
-                                const t = await r.text();
-                                let d; try { d = JSON.parse(t); } catch { throw new Error(t); }
-                                if (!r.ok) throw new Error(d.message || "Progress failed");
-                                if (statusEl) {
-                                    if (d.status === "running") statusEl.textContent = "Downloading… " + (d.percent || 0) + "%";
-                                    else if (d.status === "completed") statusEl.textContent = d.message || "Saved";
-                                    else if (d.status === "failed") statusEl.textContent = d.error || "Failed";
-                                }
-                                if (d.status === "completed") return { success: true, message: d.message };
-                                if (d.status === "failed") return { success: false, error: d.error || "Failed" };
-                                await delay(600);
-                            }
-                        })();
+                        const trackResult = await runDownload(endpoint, statusEl);
                         card.classList.remove("loading");
-                        if (trackResult.success) { card.classList.add("success"); if (statusEl) statusEl.textContent = trackResult.message || "Saved"; }
-                        else { card.classList.add("error"); if (statusEl) statusEl.textContent = trackResult.error || "Failed"; }
+                        if (trackResult.success) {
+                            card.classList.add("success");
+                            if (statusEl) statusEl.textContent = trackResult.message || "Saved";
+                            // Refresh the explorer so the just-downloaded file shows up (and gets highlighted).
+                            await loadFiles();
+                        } else {
+                            card.classList.add("error");
+                            if (statusEl) statusEl.textContent = trackResult.error || "Failed";
+                        }
                     } catch (err) {
                         card.classList.remove("loading"); card.classList.add("error");
                         if (statusEl) statusEl.textContent = err.message || "Failed";
                     }
                 });
             });
+
+            // One-click: download 251 (audio) → 137 (video) → merge, with the button
+            // itself acting as a three-stage progress bar (fill sweeps + text inverts).
+            const comboBtn = document.getElementById("combo-best");
+            if (comboBtn) {
+                const comboFill = comboBtn.querySelector(".combo-fill");
+                const comboLabel = comboBtn.querySelector(".combo-label");
+                const idleLabel = comboLabel ? comboLabel.textContent : "1080p + audio → MP4";
+                const setFill = (p) => { if (comboFill) comboFill.style.width = Math.max(0, Math.min(100, p)) + "%"; };
+                const setLabel = (t) => { if (comboLabel) comboLabel.textContent = t; };
+
+                const findCard = (itag) => document.querySelector('.format-card[data-itag="' + itag + '"]');
+                const videoCard = findCard("137");
+                const audioCard = findCard("251");
+                if (!videoCard || !audioCard) {
+                    comboBtn.disabled = true;
+                    comboBtn.classList.add("unavailable");
+                    comboBtn.title = "Needs both itag 137 (1080p video) and itag 251 (audio) in this list";
+                } else {
+                    const markCard = (card, cls) => {
+                        card.classList.remove("loading", "success", "error");
+                        if (cls) card.classList.add(cls);
+                    };
+                    comboBtn.addEventListener("click", async () => {
+                        if (comboBtn.disabled) return;
+                        comboBtn.disabled = true;
+                        const vStatus = videoCard.querySelector(".format-status");
+                        const aStatus = audioCard.querySelector(".format-status");
+                        try {
+                            // Stage 1/3 — audio (itag 251)
+                            setFill(0); setLabel("1/3 · audio · 0%");
+                            markCard(audioCard, "loading");
+                            const a = await runDownload(audioCard.dataset.endpoint, aStatus, (p) => {
+                                setFill(p); setLabel("1/3 · audio · " + p + "%");
+                            });
+                            markCard(audioCard, a.success ? "success" : "error");
+                            await loadFiles();
+                            if (!a.success) throw new Error(a.error || "Audio download failed");
+
+                            // Stage 2/3 — video (itag 137)
+                            setFill(0); setLabel("2/3 · video · 0%");
+                            markCard(videoCard, "loading");
+                            const v = await runDownload(videoCard.dataset.endpoint, vStatus, (p) => {
+                                setFill(p); setLabel("2/3 · video · " + p + "%");
+                            });
+                            markCard(videoCard, v.success ? "success" : "error");
+                            await loadFiles();
+                            if (!v.success) throw new Error(v.error || "Video download failed");
+                            if (!a.path || !v.path) throw new Error("Could not determine downloaded file names to merge");
+
+                            // Stage 3/3 — merge
+                            setFill(0); setLabel("3/3 · merging · 0%");
+                            setStatus("Merging 137 + 251 into a phone-ready MP4…");
+                            const m = await runMerge([v.path, a.path], (p) => {
+                                setFill(p); setLabel("3/3 · merging · " + p + "%");
+                            });
+                            if (!m.success) throw new Error(m.error || "Merge failed");
+                            setFill(100); setLabel("✓ done");
+                            setStatus(m.message || "Merged.", "success");
+                            await loadFiles();
+                            // Restore the idle caption a few seconds after success.
+                            setTimeout(() => { if (!comboBtn.disabled) { setFill(0); setLabel(idleLabel); } }, 4000);
+                        } catch (err) {
+                            setFill(0); setLabel("⚠ retry");
+                            setStatus("Failed: " + (err.message || err), "error");
+                        } finally {
+                            comboBtn.disabled = false;
+                        }
+                    });
+                }
+            }
         });
     </script>
 </body>

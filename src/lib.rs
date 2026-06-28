@@ -130,7 +130,7 @@ impl YoutubeDownloader {
         debug!("Invoking yt-dlp for itag {itag}: {:?}", command.as_std());
 
         let mut child = command.spawn()?;
-        let _stdout = child
+        let stdout = child
             .stdout
             .take()
             .ok_or_else(|| YtdlError::CliSpawn("missing stdout".into()))?;
@@ -139,9 +139,13 @@ impl YoutubeDownloader {
             .take()
             .ok_or_else(|| YtdlError::CliSpawn("missing stderr".into()))?;
 
-        let mut reader = BufReader::new(stderr);
+        // yt-dlp prints progress (`[download] 45.2%`) to stdout, so parse stdout for
+        // percentages and drain stderr in the background — this both avoids a full-pipe
+        // deadlock and keeps stderr text for error reporting.
+        let stderr_task = drain_to_string(stderr);
+
+        let mut reader = BufReader::new(stdout);
         let mut line = String::new();
-        let mut stderr_str = String::new();
         let progress_sender = progress.as_ref();
 
         loop {
@@ -150,7 +154,6 @@ impl YoutubeDownloader {
             if bytes == 0 {
                 break;
             }
-            stderr_str.push_str(&line);
             if let Some(percent) = parse_ytdlp_pct(line.trim()) {
                 if let Some(sender) = progress_sender {
                     let _ = sender.send(percent as u8);
@@ -159,7 +162,7 @@ impl YoutubeDownloader {
         }
 
         let status = child.wait().await?;
-        let stderr_str = stderr_str.trim().to_string();
+        let stderr_str = stderr_task.await.unwrap_or_default().trim().to_string();
         drop(queue_guard);
 
         if !status.success() {
@@ -284,14 +287,20 @@ impl YoutubeDownloader {
         }
 
         let mut child = command.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| YtdlError::CliSpawn("missing stdout".into()))?;
         let stderr = child
             .stderr
             .take()
             .ok_or_else(|| YtdlError::CliSpawn("missing stderr".into()))?;
 
-        let mut reader = BufReader::new(stderr);
+        // Progress lines arrive on stdout; drain stderr in the background for errors.
+        let stderr_task = drain_to_string(stderr);
+
+        let mut reader = BufReader::new(stdout);
         let mut line = String::new();
-        let mut stderr_str = String::new();
 
         loop {
             line.clear();
@@ -299,12 +308,7 @@ impl YoutubeDownloader {
             if bytes == 0 {
                 break;
             }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            stderr_str.push_str(&line);
-            if let Some(percent) = parse_ytdlp_pct(trimmed) {
+            if let Some(percent) = parse_ytdlp_pct(line.trim()) {
                 if let Some(sender) = progress {
                     let _ = sender.send(percent as u8);
                 }
@@ -312,6 +316,7 @@ impl YoutubeDownloader {
         }
 
         let status = child.wait().await?;
+        let stderr_str = stderr_task.await.unwrap_or_default();
         drop(queue_guard);
 
         if !status.success() {
@@ -461,6 +466,27 @@ fn stream_type_ytdlp(f: &YtdlpFormat) -> (String, bool, bool) {
         "unknown"
     };
     (t.to_string(), v, a)
+}
+
+/// Spawn a task that reads an async stream to its end as a (lossy) String. Used to
+/// drain yt-dlp's stderr without blocking the stdout progress loop or filling the pipe.
+fn drain_to_string<R>(stream: R) -> tokio::task::JoinHandle<String>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stream);
+        let mut buf = String::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => buf.push_str(&line),
+            }
+        }
+        buf
+    })
 }
 
 fn parse_ytdlp_pct(line: &str) -> Option<i32> {
