@@ -1,15 +1,18 @@
 //! HTTP server for the standalone downloader: check video, list formats, download by itag.
 
 use std::collections::HashMap;
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use downloader::{ensure_ytdlp_available, StreamInfo, YoutubeDownloader};
+use downloader::{
+    ensure_ytdlp_available, install_deno, resolve_deno_exe_path, StreamInfo, YoutubeDownloader,
+};
 use once_cell::sync::Lazy;
 use rusty_ytdl::{VideoFormat, VideoInfo};
 use serde_json::json;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -34,6 +37,17 @@ const EXPLORER_HTML: &str = r#"<div class="explorer" id="explorer">
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
 static DOWNLOAD_JOBS: Lazy<Arc<Mutex<HashMap<String, DownloadJobState>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+/// Progress/state of the deno (JS runtime) auto-install.
+#[derive(Clone, Default)]
+struct DenoState {
+    installed: bool,
+    downloading: bool,
+    percent: u8,
+    error: Option<String>,
+}
+static DENO_STATE: Lazy<Arc<Mutex<DenoState>>> =
+    Lazy::new(|| Arc::new(Mutex::new(DenoState::default())));
 
 #[derive(Clone)]
 struct DownloadJobState {
@@ -71,17 +85,34 @@ pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Syn
 
     std::fs::create_dir_all("downloaded")?;
 
-    println!("YouTube Downloader server: http://localhost:{}", listen_port);
-
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let downloader = downloader.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(downloader, stream).await {
-                eprintln!("HTTP error: {}", e);
-            }
-        });
+    // Reflect whether the deno JS runtime is already present (the UI offers to install it).
+    {
+        let mut s = DENO_STATE.lock().await;
+        s.installed = resolve_deno_exe_path().is_some();
     }
+
+    println!("YouTube Downloader server: http://localhost:{}", listen_port);
+    println!("Press Ctrl+C to stop.");
+
+    // Serve until Ctrl+C, then shut down cleanly.
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let downloader = downloader.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(downloader, stream).await {
+                        eprintln!("HTTP error: {}", e);
+                    }
+                });
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nShutting down…");
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn handle_connection(
@@ -94,6 +125,14 @@ async fn handle_connection(
         return Ok(());
     }
     let request = String::from_utf8_lossy(&buffer[..n]);
+
+    // Binary file streaming (video player) needs raw bytes + Range support,
+    // which the text-response path can't express — handle it separately.
+    let first_line = request.lines().next().unwrap_or("");
+    if first_line.starts_with("GET /file?") || first_line == "GET /file HTTP/1.1" {
+        return serve_file_request(&mut stream, &request).await;
+    }
+
     let (status, body, content_type, _) = parse_and_handle_request(&downloader, &request).await;
     let response = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -101,6 +140,115 @@ async fn handle_connection(
         content_type,
         body.as_bytes().len(),
         body
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+/// MIME type for the player, by file extension.
+fn content_type_for(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "mov" => "video/quicktime",
+        "m4a" => "audio/mp4",
+        "mp3" => "audio/mpeg",
+        "opus" | "oga" | "ogg" | "weba" => "audio/ogg",
+        "wav" => "audio/wav",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Parse a `Range: bytes=start-end` header into an inclusive (start, end) pair.
+fn parse_range_header(request: &str, total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let line = request
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("range:"))?;
+    let val = line.splitn(2, ':').nth(1)?.trim();
+    let rng = val.strip_prefix("bytes=")?;
+    let (s, e) = rng.split_once('-')?;
+    if s.is_empty() {
+        let n: u64 = e.trim().parse().ok()?;
+        return Some((total.saturating_sub(n), total - 1));
+    }
+    let start: u64 = s.trim().parse().ok()?;
+    let end: u64 = if e.trim().is_empty() { total - 1 } else { e.trim().parse().ok()? };
+    if start > end || start >= total {
+        return None;
+    }
+    Some((start, end.min(total - 1)))
+}
+
+/// Serve a file from downloaded/ with Range support so the browser <video> can seek.
+async fn serve_file_request(
+    stream: &mut TcpStream,
+    request: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let target = request
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let mut name = None::<String>;
+    for (k, v) in form_urlencoded::parse(query.as_bytes()) {
+        if k == "name" {
+            name = Some(v.into_owned());
+            break;
+        }
+    }
+    let Some(name) = name else {
+        return write_plain(stream, "400 Bad Request", "missing name").await;
+    };
+    if !is_safe_filename(&name) {
+        return write_plain(stream, "400 Bad Request", "invalid name").await;
+    }
+    let path = downloaded_dir().join(&name);
+    let meta = match tokio::fs::metadata(&path).await {
+        Ok(m) if m.is_file() => m,
+        _ => return write_plain(stream, "404 Not Found", "not found").await,
+    };
+    let total = meta.len();
+    let ctype = content_type_for(&name);
+    let mut file = tokio::fs::File::open(&path).await?;
+
+    match parse_range_header(request, total) {
+        Some((start, end)) => {
+            let len = end - start + 1;
+            let header = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Type: {ctype}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{total}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(header.as_bytes()).await?;
+            file.seek(SeekFrom::Start(start)).await?;
+            let mut limited = file.take(len);
+            tokio::io::copy(&mut limited, stream).await?;
+        }
+        None => {
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nAccept-Ranges: bytes\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(header.as_bytes()).await?;
+            tokio::io::copy(&mut file, stream).await?;
+        }
+    }
+    stream.shutdown().await?;
+    Ok(())
+}
+
+/// Write a tiny plain-text HTTP response (used for file-serving errors).
+async fn write_plain(
+    stream: &mut TcpStream,
+    status: &str,
+    body: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.as_bytes().len()
     );
     stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await?;
@@ -132,11 +280,26 @@ async fn parse_and_handle_request(
     if path == "/open-folder" {
         return handle_open_folder().await;
     }
+    if path == "/downloaded-dir" {
+        return handle_downloaded_dir().await;
+    }
+    if path == "/deno-status" {
+        return handle_deno_status().await;
+    }
+    if path == "/install-deno" {
+        return handle_install_deno().await;
+    }
     if path == "/merge" {
         return handle_merge(query).await;
     }
     if path == "/to-mp3" {
         return handle_to_mp3(query).await;
+    }
+    if path == "/subtitles" {
+        return handle_list_subtitles(downloader, query).await;
+    }
+    if path == "/download-subs" {
+        return handle_download_subtitle(downloader, query).await;
     }
     if path == "/download/status" {
         return handle_download_status(query).await;
@@ -494,6 +657,96 @@ async fn handle_open_folder() -> (String, String, String, Option<PathBuf>) {
         ),
         Err(e) => json_error(&format!("Could not open folder: {}", e)),
     }
+}
+
+/// Return the absolute path of the downloaded/ folder (shown in the player modal).
+async fn handle_downloaded_dir() -> (String, String, String, Option<PathBuf>) {
+    let dir = downloaded_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let abs = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let path_str = abs.to_string_lossy().to_string();
+    let cleaned = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str).to_string();
+    (
+        "200 OK".to_string(),
+        json!({ "path": cleaned }).to_string(),
+        "application/json".to_string(),
+        None,
+    )
+}
+
+/// Report whether the deno JS runtime is installed / downloading, for the UI banner.
+async fn handle_deno_status() -> (String, String, String, Option<PathBuf>) {
+    let s = DENO_STATE.lock().await.clone();
+    (
+        "200 OK".to_string(),
+        json!({
+            "installed": s.installed,
+            "downloading": s.downloading,
+            "percent": s.percent,
+            "error": s.error,
+        })
+        .to_string(),
+        "application/json".to_string(),
+        None,
+    )
+}
+
+/// Start (or report) the deno auto-install; progress is polled via /deno-status.
+async fn handle_install_deno() -> (String, String, String, Option<PathBuf>) {
+    {
+        let mut s = DENO_STATE.lock().await;
+        if s.installed {
+            return (
+                "200 OK".to_string(),
+                json!({ "status": "installed" }).to_string(),
+                "application/json".to_string(),
+                None,
+            );
+        }
+        if s.downloading {
+            return (
+                "200 OK".to_string(),
+                json!({ "status": "downloading", "percent": s.percent }).to_string(),
+                "application/json".to_string(),
+                None,
+            );
+        }
+        s.downloading = true;
+        s.percent = 0;
+        s.error = None;
+    }
+
+    tokio::spawn(async move {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+        let progress_task = tokio::spawn(async move {
+            while let Some(pct) = rx.recv().await {
+                let mut s = DENO_STATE.lock().await;
+                s.percent = pct;
+            }
+        });
+
+        let result = install_deno(Some(tx)).await;
+        let _ = progress_task.await;
+
+        let mut s = DENO_STATE.lock().await;
+        s.downloading = false;
+        match result {
+            Ok(_) => {
+                s.installed = true;
+                s.percent = 100;
+            }
+            Err(e) => {
+                s.error = Some(e.to_string());
+            }
+        }
+    });
+
+    (
+        "200 OK".to_string(),
+        json!({ "status": "started" }).to_string(),
+        "application/json".to_string(),
+        None,
+    )
 }
 
 /// Locate a tool: prefer a local copy (cwd or next to the binary), else rely on PATH.
@@ -903,6 +1156,87 @@ async fn handle_to_mp3(query: Option<&str>) -> (String, String, String, Option<P
     )
 }
 
+/// List available subtitle/caption tracks for a video (JSON for the UI).
+async fn handle_list_subtitles(
+    downloader: &YoutubeDownloader,
+    query: Option<&str>,
+) -> (String, String, String, Option<PathBuf>) {
+    let Some(q) = query else {
+        return json_error("Missing video");
+    };
+    let mut video = None::<String>;
+    for (key, value) in form_urlencoded::parse(q.as_bytes()) {
+        if key == "video" {
+            video = Some(value.into_owned());
+            break;
+        }
+    }
+    let Some(video) = video else {
+        return json_error("Missing video");
+    };
+
+    match downloader.fetch_subtitles(&video).await {
+        Ok(tracks) => {
+            let arr: Vec<serde_json::Value> = tracks
+                .iter()
+                .map(|t| json!({ "lang": t.lang, "name": t.name, "kind": t.kind, "exts": t.exts }))
+                .collect();
+            (
+                "200 OK".to_string(),
+                json!({ "status": "ok", "tracks": arr }).to_string(),
+                "application/json".to_string(),
+                None,
+            )
+        }
+        Err(e) => json_error(&format!("Could not list subtitles: {}", e)),
+    }
+}
+
+/// Download one subtitle track into downloaded/.
+async fn handle_download_subtitle(
+    downloader: &YoutubeDownloader,
+    query: Option<&str>,
+) -> (String, String, String, Option<PathBuf>) {
+    let Some(q) = query else {
+        return json_error("Missing parameters");
+    };
+    let mut video = None::<String>;
+    let mut lang = None::<String>;
+    let mut format = None::<String>;
+    let mut kind = String::from("manual");
+    for (key, value) in form_urlencoded::parse(q.as_bytes()) {
+        match key.as_ref() {
+            "video" => video = Some(value.into_owned()),
+            "lang" => lang = Some(value.into_owned()),
+            "format" => format = Some(value.into_owned()),
+            "kind" => kind = value.into_owned(),
+            _ => {}
+        }
+    }
+    let (Some(video), Some(lang), Some(format)) = (video, lang, format) else {
+        return json_error("Missing video, lang or format");
+    };
+    let auto = kind == "auto";
+
+    match downloader.download_subtitle(&video, &lang, &format, auto).await {
+        Ok(path) => {
+            let rel = path
+                .strip_prefix(downloader.download_dir())
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            (
+                "200 OK".to_string(),
+                json!({ "status": "ok", "output": rel, "message": format!("Saved {}", rel) })
+                    .to_string(),
+                "application/json".to_string(),
+                None,
+            )
+        }
+        Err(e) => json_error(&format!("Subtitle download failed: {}", e)),
+    }
+}
+
 fn render_page(
     input_value: &str,
     video_info: Option<&VideoInfo>,
@@ -965,18 +1299,29 @@ fn render_video_info(
     } else {
         format!(r#"<div><a href="{video_url}" target="_blank" rel="noopener"><img src="{thumb}" alt="Thumbnail" loading="lazy" /></a></div>"#)
     };
+    let subs_html = render_subtitles_panel(raw_url, video_id);
     format!(
-        r#"<div class="card"><div class="card-head">{thumb_html}<div class="meta"><h2><a href="{video_url}" target="_blank" rel="noopener">{title}</a></h2><div class="stats"><span>👤 {channel}</span><span>⏱ {duration}</span><span>👁 {views} views</span><span>📅 {publish_date}</span></div></div></div><div class="links">{format_html}</div></div>"#
+        r#"<div class="card"><div class="card-head">{thumb_html}<div class="meta"><h2><a href="{video_url}" target="_blank" rel="noopener">{title}</a></h2><div class="stats"><span>👤 {channel}</span><span>⏱ {duration}</span><span>👁 {views} views</span><span>📅 {publish_date}</span></div></div></div><div class="links">{format_html}{subs_html}</div></div>"#
+    )
+}
+
+/// Subtitles/captions panel: language + format selectors and a download button.
+/// The language list is populated by JS via /subtitles.
+fn render_subtitles_panel(raw_url: &str, video_id: &str) -> String {
+    let video = html_escape(raw_url);
+    let vid = html_escape(video_id);
+    format!(
+        r#"<div class="subs" id="subs" data-video="{video}" data-video-id="{vid}" style="display:none"><h3>📝 Субтитры / Subtitles</h3><div class="subs-controls"><select id="subs-lang" disabled><option value="">Загрузка…</option></select><select id="subs-format"><option value="srt" selected>SRT</option><option value="txt">TXT (текст)</option><option value="vtt">VTT</option><option value="ttml">TTML</option><option value="srv3">SRV3</option><option value="srv2">SRV2</option><option value="srv1">SRV1</option><option value="json3">JSON3</option><option value="ass">ASS</option><option value="lrc">LRC</option></select><button type="button" id="subs-download" disabled>Скачать субтитры</button></div><div class="subs-status" id="subs-status"></div></div>"#
     )
 }
 
 fn render_format_filter_radios() -> String {
     r#"<div class="format-filter" role="group" aria-label="Filter by stream type">
-        <span class="format-filter-label">Filter:</span>
-        <label><input type="radio" name="format-filter" value="all" checked> ALL</label>
-        <label><input type="radio" name="format-filter" value="video"> V</label>
-        <label><input type="radio" name="format-filter" value="audio"> A</label>
-        <label><input type="radio" name="format-filter" value="muxed"> V & A</label>
+        <label title="Все / All"><input type="radio" name="format-filter" value="all" checked><svg class="fi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg></label>
+        <label title="Только видео / Video only"><input type="radio" name="format-filter" value="video"><svg class="fi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.2 6 3 11l-.9-2.4c-.3-1 .3-2 1.3-2.3l13.6-4c1-.3 2 .3 2.3 1.3Z"/><path d="m6.2 5.3 3.1 3.9M12.4 3.4l3.1 4M3 11h18v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg></label>
+        <label title="Только звук / Audio only"><input type="radio" name="format-filter" value="audio"><svg class="fi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></label>
+        <label title="Видео + звук / Video &amp; Audio"><input type="radio" name="format-filter" value="muxed"><svg class="fi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 3v18M17 3v18M3 7.5h4M17 7.5h4M3 12h18M3 16.5h4M17 16.5h4"/></svg></label>
+        <label title="Субтитры / Subtitles"><input type="radio" name="format-filter" value="sub"><svg class="fi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 15h4M15 15h2M7 11h2M13 11h4"/></svg></label>
         <button type="button" id="combo-best" class="combo-btn" title="Download itag 137 (1080p video) + 251 (audio), then merge into a phone-ready MP4"><span class="combo-fill"></span><span class="combo-label">⬇ 1080p + 🎵 → MP4</span></button>
     </div>"#.to_string()
 }
@@ -1012,7 +1357,7 @@ fn render_format_list_streams(streams: &[StreamInfo], video_url: &str, video_id:
         .map(|s| render_format_card_stream(s, video_url, video_id))
         .collect();
     let filter_radios = render_format_filter_radios();
-    format!(r#"<div class="format-list"><h3>Available formats</h3>{filter_radios}<div class="format-grid">{cards}</div></div>"#)
+    format!(r#"<div class="format-list"><h3>Available formats</h3>{filter_radios}<div class="format-grid">{cards}</div><p class="format-empty" id="format-empty" hidden></p></div>"#)
 }
 
 /// Render one format as a single compact line: itag | quality | codecs | bitrate.
@@ -1061,7 +1406,7 @@ fn render_format_list(formats: &[VideoFormat], video_url: &str) -> String {
         .map(|f| render_format_card(f, video_url))
         .collect();
     let filter_radios = render_format_filter_radios();
-    format!(r#"<div class="format-list"><h3>Available formats</h3>{filter_radios}<div class="format-grid">{cards}</div></div>"#)
+    format!(r#"<div class="format-list"><h3>Available formats</h3>{filter_radios}<div class="format-grid">{cards}</div><p class="format-empty" id="format-empty" hidden></p></div>"#)
 }
 
 fn render_format_card(fmt: &VideoFormat, video_url: &str) -> String {

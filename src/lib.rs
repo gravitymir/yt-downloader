@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 //! YouTube download via yt-dlp. Uses yt-dlp.exe in the same folder as downloader.exe.
 
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,6 +22,10 @@ use rusty_ytdl::{Video, VideoFormat, VideoInfo};
 #[derive(Deserialize)]
 struct YtdlpInfo {
     formats: Option<Vec<YtdlpFormat>>,
+    subtitles: Option<HashMap<String, Vec<YtdlpSub>>>,
+    automatic_captions: Option<HashMap<String, Vec<YtdlpSub>>>,
+    /// The video's primary/original language (may be null).
+    language: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -31,6 +36,22 @@ struct YtdlpFormat {
     tbr: Option<f64>,
     vcodec: Option<String>,
     acodec: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct YtdlpSub {
+    ext: Option<String>,
+    name: Option<String>,
+}
+
+/// One available subtitle/caption track for a video.
+#[derive(Debug, Clone)]
+pub struct SubtitleTrack {
+    pub lang: String,
+    pub name: String,
+    /// "manual" (uploaded by author) or "auto" (auto-generated / auto-translated).
+    pub kind: &'static str,
+    pub exts: Vec<String>,
 }
 
 /// Stream info derived from yt-dlp.
@@ -183,6 +204,191 @@ impl YoutubeDownloader {
     pub async fn fetch_formats_via_cli(&self, input: &str) -> Result<Vec<StreamInfo>, YtdlError> {
         let normalized = normalise_input(input);
         self.run_ytdlp_info_json(&self.ytdlp_path, &normalized).await
+    }
+
+    /// List available subtitle/caption tracks (manual + auto) for a video.
+    pub async fn fetch_subtitles(&self, input: &str) -> Result<Vec<SubtitleTrack>, YtdlError> {
+        let normalized = normalise_input(input);
+        let info = self.run_ytdlp_raw_info(&normalized).await?;
+
+        // Only keep Russian, English, and the video's original language — drop the
+        // hundreds of auto-translated languages YouTube otherwise offers.
+        let mut allowed: HashSet<String> = HashSet::from(["ru".to_string(), "en".to_string()]);
+        if let Some(orig) = info.language.as_deref() {
+            let base = base_lang(orig);
+            if !base.is_empty() {
+                allowed.insert(base);
+            }
+        }
+
+        let mut tracks: Vec<SubtitleTrack> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        if let Some(subs) = info.subtitles {
+            for (lang, list) in subs {
+                if !allowed.contains(&base_lang(&lang)) {
+                    continue;
+                }
+                let name = list
+                    .iter()
+                    .find_map(|s| s.name.clone())
+                    .unwrap_or_else(|| lang.clone());
+                seen.insert(lang.clone());
+                tracks.push(SubtitleTrack { lang, name, kind: "manual", exts: collect_exts(&list) });
+            }
+        }
+        if let Some(autos) = info.automatic_captions {
+            for (lang, list) in autos {
+                if !allowed.contains(&base_lang(&lang)) || seen.contains(&lang) {
+                    continue; // filtered out, or a manual track already covers it
+                }
+                let name = list
+                    .iter()
+                    .find_map(|s| s.name.clone())
+                    .unwrap_or_else(|| lang.clone());
+                tracks.push(SubtitleTrack { lang, name, kind: "auto", exts: collect_exts(&list) });
+            }
+        }
+
+        // Manual first, then auto; alphabetical by language code within each group.
+        tracks.sort_by(|a, b| {
+            let ka = u8::from(a.kind == "auto");
+            let kb = u8::from(b.kind == "auto");
+            ka.cmp(&kb).then_with(|| a.lang.cmp(&b.lang))
+        });
+        Ok(tracks)
+    }
+
+    /// Download one subtitle track via yt-dlp into downloaded/. `format` is an ext
+    /// (srt/vtt/ttml/srv1..3/json3/ass/lrc) or "txt" for plain stripped text.
+    pub async fn download_subtitle(
+        &self,
+        input: &str,
+        lang: &str,
+        format: &str,
+        auto: bool,
+    ) -> Result<PathBuf, YtdlError> {
+        let normalized = normalise_input(input);
+        std::fs::create_dir_all(&self.download_dir)?;
+
+        let before = list_dir_files(&self.download_dir);
+
+        let want_txt = format.eq_ignore_ascii_case("txt");
+        let dl_format = if want_txt { "srt" } else { format };
+        let convertible = matches!(dl_format.to_lowercase().as_str(), "srt" | "vtt" | "ass" | "lrc");
+
+        // Absolute output template so yt-dlp writes into downloaded/ regardless of cwd.
+        let dir_abs = if self.download_dir.is_absolute() {
+            self.download_dir.clone()
+        } else {
+            env::current_dir()?.join(&self.download_dir)
+        };
+        let out_template = dir_abs.join("%(id)s").to_string_lossy().to_string();
+
+        let mut command = Command::new(&self.ytdlp_path);
+        command.arg("--skip-download").arg("--no-playlist");
+        if auto {
+            command.arg("--write-auto-subs");
+        } else {
+            command.arg("--write-subs");
+        }
+        command.arg("--sub-langs").arg(lang);
+        if convertible {
+            command.arg("--sub-format").arg("vtt/ttml/srv3/srv2/srv1/best");
+            command.arg("--convert-subs").arg(dl_format);
+        } else {
+            command.arg("--sub-format").arg(dl_format);
+        }
+        command.arg("-o").arg(&out_template).arg(&normalized);
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(parent) = self.ytdlp_path.parent() {
+            command.current_dir(parent);
+        }
+
+        let queue_guard = DOWNLOAD_QUEUE.lock().await;
+        let output = command.output().await?;
+        drop(queue_guard);
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(YtdlError::YtdlpCliFailed {
+                code: output.status.code(),
+                message: if stderr.is_empty() {
+                    "yt-dlp failed (no subtitles for this language/format?)".to_string()
+                } else {
+                    stderr
+                },
+            });
+        }
+
+        // Find the newly written subtitle file (named "<id>.<lang>.<ext>").
+        let after = list_dir_files(&self.download_dir);
+        let lang_marker = format!(".{}.", lang);
+        let candidates: Vec<PathBuf> = after
+            .difference(&before)
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map_or(false, |n| n.contains(&lang_marker))
+            })
+            .cloned()
+            .collect();
+
+        let want_ext = dl_format.to_lowercase();
+        let sub_path = candidates
+            .iter()
+            .find(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map_or(false, |e| e.eq_ignore_ascii_case(&want_ext))
+            })
+            .cloned()
+            .or_else(|| candidates.into_iter().next())
+            .ok_or_else(|| {
+                YtdlError::CliDiscovery(
+                    "yt-dlp produced no subtitle file (none available for this language/format)".to_string(),
+                )
+            })?;
+
+        if want_txt {
+            let content = std::fs::read_to_string(&sub_path)?;
+            let text = subtitle_to_text(&content);
+            let txt_path = sub_path.with_extension("txt");
+            std::fs::write(&txt_path, text)?;
+            let _ = std::fs::remove_file(&sub_path);
+            return Ok(txt_path);
+        }
+        Ok(sub_path)
+    }
+
+    /// Run `yt-dlp -j` and parse the raw metadata (formats + subtitles).
+    async fn run_ytdlp_raw_info(&self, normalized: &str) -> Result<YtdlpInfo, YtdlError> {
+        let mut command = Command::new(&self.ytdlp_path);
+        command
+            .args(["-j", "--no-playlist", "--no-download", normalized])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(parent) = self.ytdlp_path.parent() {
+            command.current_dir(parent);
+        }
+        let output = command.output().await?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout_s = stdout.trim().to_string();
+            let msg = if stderr.is_empty() && !stdout_s.is_empty() {
+                format!("status {:?} stdout: {}", output.status.code(), stdout_s)
+            } else if stderr.is_empty() {
+                format!("status {:?} (no stderr)", output.status.code())
+            } else {
+                stderr
+            };
+            return Err(YtdlError::YtdlpCliFailed { code: output.status.code(), message: msg });
+        }
+        serde_json::from_str::<YtdlpInfo>(stdout.trim())
+            .map_err(|e| YtdlError::CliDiscovery(format!("parse yt-dlp -j: {e}")))
     }
 
     async fn run_ytdlp_info_json(&self, ytdlp_exe: &Path, normalized: &str) -> Result<Vec<StreamInfo>, YtdlError> {
@@ -413,6 +619,117 @@ pub fn resolve_ytdlp_exe_path() -> Option<PathBuf> {
     None
 }
 
+/// Resolve deno.exe (JS runtime yt-dlp needs for some videos): cwd, the app dir,
+/// next to yt-dlp.exe, or anywhere on PATH.
+pub fn resolve_deno_exe_path() -> Option<PathBuf> {
+    if let Ok(cwd) = std::env::current_dir() {
+        let c = cwd.join("deno.exe");
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+    if let Some(dir) = resolve_app_dir() {
+        let c = dir.join("deno.exe");
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+    if let Some(yt) = resolve_ytdlp_exe_path() {
+        if let Some(parent) = yt.parent() {
+            let c = parent.join("deno.exe");
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let c = dir.join("deno.exe");
+            if c.is_file() {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// Download and unpack deno.exe next to the app binary, reporting 0..100 progress.
+/// yt-dlp then auto-detects it (it runs with that folder as its working dir).
+pub async fn install_deno(progress: Option<UnboundedSender<u8>>) -> Result<PathBuf, YtdlError> {
+    if let Some(existing) = resolve_deno_exe_path() {
+        if let Some(sender) = progress.as_ref() {
+            let _ = sender.send(100);
+        }
+        return Ok(existing);
+    }
+
+    let app_dir = resolve_app_dir()
+        .ok_or_else(|| YtdlError::CliDiscovery("cannot resolve app directory".into()))?;
+    std::fs::create_dir_all(&app_dir)?;
+    let target_exe = app_dir.join("deno.exe");
+    let zip_path = app_dir.join("deno-download.zip");
+
+    let url = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip";
+    let client = Client::builder()
+        .user_agent("yt-dlp-downloader/1.0")
+        .build()
+        .map_err(|e| YtdlError::CliDiscovery(format!("reqwest: {}", e)))?;
+    let mut resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| YtdlError::CliDiscovery(format!("deno download request: {}", e)))?;
+    if !resp.status().is_success() {
+        return Err(YtdlError::CliDiscovery(format!(
+            "deno download failed: HTTP {}",
+            resp.status()
+        )));
+    }
+
+    let total = resp.content_length();
+    let mut file = tokio::fs::File::create(&zip_path).await?;
+    let mut downloaded: u64 = 0;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| YtdlError::CliDiscovery(format!("deno download read: {}", e)))?
+    {
+        file.write_all(&chunk).await?;
+        downloaded += chunk.len() as u64;
+        if let (Some(t), Some(sender)) = (total, progress.as_ref()) {
+            if t > 0 {
+                // Reserve the last 1% for extraction so the bar isn't stuck at 100 mid-unzip.
+                let pct = ((downloaded as f64 / t as f64) * 99.0) as u8;
+                let _ = sender.send(pct.min(99));
+            }
+        }
+    }
+    file.flush().await?;
+    drop(file);
+
+    // Windows ships bsdtar as `tar`, which unpacks zip — no extra crate needed.
+    let status = Command::new("tar")
+        .arg("-xf")
+        .arg(&zip_path)
+        .arg("-C")
+        .arg(&app_dir)
+        .status()
+        .await
+        .map_err(|e| YtdlError::CliDiscovery(format!("tar spawn: {}", e)))?;
+    let _ = std::fs::remove_file(&zip_path);
+    if !status.success() {
+        return Err(YtdlError::CliDiscovery("unzip (tar) failed".into()));
+    }
+    if !target_exe.is_file() {
+        return Err(YtdlError::MissingOutput(target_exe));
+    }
+    log::info!("Installed deno to {:?}", target_exe);
+    if let Some(sender) = progress.as_ref() {
+        let _ = sender.send(100);
+    }
+    Ok(target_exe)
+}
+
 #[derive(Debug, Error)]
 pub enum YtdlError {
     #[error("rusty_ytdl error: {0}")]
@@ -487,6 +804,89 @@ where
         }
         buf
     })
+}
+
+/// Base language code without region/variant suffix (e.g. "en-US" -> "en").
+fn base_lang(code: &str) -> String {
+    code.split(|c| c == '-' || c == '_')
+        .next()
+        .unwrap_or(code)
+        .to_lowercase()
+}
+
+/// Unique subtitle extensions offered for a track, preserving first-seen order.
+fn collect_exts(list: &[YtdlpSub]) -> Vec<String> {
+    let mut exts: Vec<String> = Vec::new();
+    for s in list {
+        if let Some(e) = &s.ext {
+            if !exts.contains(e) {
+                exts.push(e.clone());
+            }
+        }
+    }
+    exts
+}
+
+/// Snapshot the set of regular files currently in `dir`.
+fn list_dir_files(dir: &Path) -> HashSet<PathBuf> {
+    let mut set = HashSet::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                set.insert(p);
+            }
+        }
+    }
+    set
+}
+
+/// Strip SRT/VTT markup and timing to plain transcript text.
+fn subtitle_to_text(content: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut last = String::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty()
+            || line.contains("-->")
+            || line.starts_with("WEBVTT")
+            || line.starts_with("Kind:")
+            || line.starts_with("Language:")
+            || line.starts_with("NOTE")
+            || line.chars().all(|c| c.is_ascii_digit())
+        {
+            continue;
+        }
+        let cleaned = strip_tags(line);
+        let cleaned = cleaned.trim();
+        if cleaned.is_empty() || cleaned == last {
+            continue;
+        }
+        last = cleaned.to_string();
+        out.push(cleaned.to_string());
+    }
+    out.join("\n")
+}
+
+/// Remove `<...>` tags and decode a few common HTML entities.
+fn strip_tags(s: &str) -> String {
+    let mut result = String::new();
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => result.push(c),
+            _ => {}
+        }
+    }
+    result
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&#39;", "'")
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
 }
 
 fn parse_ytdlp_pct(line: &str) -> Option<i32> {
