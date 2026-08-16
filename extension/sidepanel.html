@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YT Downloader</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0f172a; color: #f8fafc;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif; display: flex; flex-direction: column; }
+    #bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.2); font-size: 12px; }
+    #status { flex: 1; color: #94a3b8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #status.ok { color: #86efac; }
+    #status.err { color: #fca5a5; }
+    button { font: inherit; font-size: 12px; padding: 4px 9px; border-radius: 6px; cursor: pointer;
+      color: #f8fafc; background: rgba(148, 163, 184, 0.16); border: 1px solid rgba(148, 163, 184, 0.3); }
+    button:hover { background: rgba(148, 163, 184, 0.28); }
+    #app { flex: 1; width: 100%; border: 0; background: #0f172a; }
+    #err { display: none; padding: 18px; font-size: 13px; line-height: 1.6; }
+    #err code { background: rgba(148, 163, 184, 0.15); padding: 2px 5px; border-radius: 4px; }
+    a { color: #38bdf8; }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <span id="status">Подключение…</span>
+    <button id="refresh" title="Отправить cookies заново и перезагрузить">↻ cookies</button>
+  </div>
+  <iframe id="app" title="YT Downloader"></iframe>
+  <div id="err"></div>
+  <script src="sidepanel.js"></script>
+</body>
+</html>

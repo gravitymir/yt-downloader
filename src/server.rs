@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use downloader::{
-    ensure_ytdlp_available, install_deno, resolve_deno_exe_path, StreamInfo, YoutubeDownloader,
+    ensure_ytdlp_available, install_deno, resolve_deno_exe_path, set_cookies_file, StreamInfo,
+    YoutubeDownloader,
 };
 use once_cell::sync::Lazy;
 use rusty_ytdl::{VideoFormat, VideoInfo};
@@ -75,12 +76,26 @@ impl DownloadJobStatus {
     }
 }
 
-/// Bind to host:port and run the HTTP server. Uses 127.0.0.1:port (port from DOWNLOADER_PORT or 8080).
+/// Bind to host:port and run the HTTP server. Tries `port`, then the next two
+/// (port+1, port+2) if busy — the Chrome extension probes the same 3 ports.
 pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ensure_ytdlp_available().await?;
-    let listen_port = port;
-    let addr = format!("127.0.0.1:{}", listen_port);
-    let listener = TcpListener::bind(&addr).await?;
+
+    let last = port.saturating_add(2);
+    let mut bound: Option<(TcpListener, u16)> = None;
+    for p in port..=last {
+        match TcpListener::bind(("127.0.0.1", p)).await {
+            Ok(l) => {
+                bound = Some((l, p));
+                break;
+            }
+            Err(e) => eprintln!("Port {} is busy ({}), trying next…", p, e),
+        }
+    }
+    let (listener, listen_port) = match bound {
+        Some(pair) => pair,
+        None => return Err(format!("Ports {}–{} are all busy", port, last).into()),
+    };
     let downloader = Arc::new(YoutubeDownloader::new()?);
 
     std::fs::create_dir_all("downloaded")?;
@@ -125,10 +140,23 @@ async fn handle_connection(
         return Ok(());
     }
     let request = String::from_utf8_lossy(&buffer[..n]);
+    let first_line = request.lines().next().unwrap_or("");
+
+    // CORS preflight (the Chrome extension may probe before POSTing cookies).
+    if first_line.starts_with("OPTIONS ") {
+        let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        stream.write_all(response.as_bytes()).await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
+    // Chrome extension uploads YouTube cookies here (may exceed the initial read).
+    if first_line.starts_with("POST /cookies") {
+        return handle_post_cookies(&mut stream, &buffer[..n]).await;
+    }
 
     // Binary file streaming (video player) needs raw bytes + Range support,
     // which the text-response path can't express — handle it separately.
-    let first_line = request.lines().next().unwrap_or("");
     if first_line.starts_with("GET /file?") || first_line == "GET /file HTTP/1.1" {
         return serve_file_request(&mut stream, &request).await;
     }
@@ -236,6 +264,66 @@ async fn serve_file_request(
             tokio::io::copy(&mut file, stream).await?;
         }
     }
+    stream.shutdown().await?;
+    Ok(())
+}
+
+/// Receive YouTube cookies (Netscape cookies.txt) from the extension, save them,
+/// and point yt-dlp at the file for subsequent requests.
+async fn handle_post_cookies(
+    stream: &mut TcpStream,
+    initial: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Split headers from the (possibly partial) body already read.
+    let sep_pos = initial.windows(4).position(|w| w == b"\r\n\r\n");
+    let (head, mut body): (&[u8], Vec<u8>) = match sep_pos {
+        Some(p) => (&initial[..p], initial[p + 4..].to_vec()),
+        None => (initial, Vec::new()),
+    };
+    let head_str = String::from_utf8_lossy(head);
+    let content_length = head_str
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+
+    // Read the rest of the body (cookies.txt can be larger than one TCP read).
+    let mut buf = vec![0u8; 8192];
+    while body.len() < content_length {
+        let k = stream.read(&mut buf).await?;
+        if k == 0 {
+            break;
+        }
+        body.extend_from_slice(&buf[..k]);
+    }
+    if body.len() > content_length && content_length > 0 {
+        body.truncate(content_length);
+    }
+
+    let text = String::from_utf8_lossy(&body).to_string();
+    let count = text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .count();
+
+    let path = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("cookies.txt");
+    if let Err(e) = tokio::fs::write(&path, text.as_bytes()).await {
+        return write_plain(stream, "500 Internal Server Error", &format!("save failed: {}", e)).await;
+    }
+    set_cookies_file(Some(path.clone()));
+    log::info!("Saved {} cookies to {:?}", count, path);
+
+    let body_json =
+        json!({ "status": "ok", "cookies": count, "saved": path.display().to_string() }).to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body_json.as_bytes().len(),
+        body_json
+    );
+    stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await?;
     Ok(())
 }

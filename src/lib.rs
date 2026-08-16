@@ -70,6 +70,18 @@ pub struct StreamInfo {
 
 static DOWNLOAD_QUEUE: Lazy<Arc<Mutex<()>>> = Lazy::new(|| Arc::new(Mutex::new(())));
 
+/// A cookies.txt file to authenticate yt-dlp with, set at runtime (e.g. by the
+/// Chrome extension via POST /cookies). Takes precedence over the env vars.
+static COOKIES_FILE: Lazy<std::sync::Mutex<Option<PathBuf>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
+
+/// Set (or clear with None) the cookies.txt file used for all yt-dlp calls.
+pub fn set_cookies_file(path: Option<PathBuf>) {
+    if let Ok(mut g) = COOKIES_FILE.lock() {
+        *g = path;
+    }
+}
+
 /// High-level wrapper that shells out to yt-dlp.exe (same folder as downloader.exe).
 #[derive(Clone)]
 pub struct YoutubeDownloader {
@@ -144,6 +156,7 @@ impl YoutubeDownloader {
             .args(["-f", &itag.to_string(), "-o", absolute_output.to_string_lossy().as_ref(), "--newline", "--no-playlist", &normalized])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        command.args(cookie_args());
         if let Some(parent) = self.ytdlp_path.parent() {
             command.current_dir(parent);
         }
@@ -303,6 +316,7 @@ impl YoutubeDownloader {
         command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        command.args(cookie_args());
         if let Some(parent) = self.ytdlp_path.parent() {
             command.current_dir(parent);
         }
@@ -370,6 +384,7 @@ impl YoutubeDownloader {
             .args(["-j", "--no-playlist", "--no-download", normalized])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        command.args(cookie_args());
         if let Some(parent) = self.ytdlp_path.parent() {
             command.current_dir(parent);
         }
@@ -397,6 +412,7 @@ impl YoutubeDownloader {
             .args(["-j", "--no-playlist", "--no-download", normalized])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        command.args(cookie_args());
         if let Some(parent) = ytdlp_exe.parent() {
             command.current_dir(parent);
         }
@@ -488,6 +504,7 @@ impl YoutubeDownloader {
             ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        command.args(cookie_args());
         if let Some(parent) = ytdlp_exe.parent() {
             command.current_dir(parent);
         }
@@ -893,6 +910,32 @@ fn parse_ytdlp_pct(line: &str) -> Option<i32> {
     let idx = line.find('%')?;
     let num = line[..idx].trim().split_whitespace().last()?;
     num.parse::<f64>().ok().map(|f| f as i32)
+}
+
+/// Extra yt-dlp args for YouTube cookie authentication (needed for age-restricted
+/// or members-only videos). Configured via environment variables:
+///   DOWNLOADER_COOKIES_BROWSER — e.g. "firefox", "chrome", "edge", "brave"
+///   DOWNLOADER_COOKIES_FILE    — path to an exported cookies.txt
+/// Browser takes precedence; empty/unset means no cookies are passed.
+fn cookie_args() -> Vec<String> {
+    if let Ok(g) = COOKIES_FILE.lock() {
+        if let Some(p) = g.as_ref() {
+            return vec!["--cookies".to_string(), p.display().to_string()];
+        }
+    }
+    if let Ok(browser) = std::env::var("DOWNLOADER_COOKIES_BROWSER") {
+        let b = browser.trim();
+        if !b.is_empty() {
+            return vec!["--cookies-from-browser".to_string(), b.to_string()];
+        }
+    }
+    if let Ok(file) = std::env::var("DOWNLOADER_COOKIES_FILE") {
+        let f = file.trim();
+        if !f.is_empty() {
+            return vec!["--cookies".to_string(), f.to_string()];
+        }
+    }
+    Vec::new()
 }
 
 fn normalise_input(input: &str) -> String {
