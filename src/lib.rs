@@ -37,9 +37,11 @@ struct YtdlpFormat {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamInfo {
-    pub itag: Option<u64>,
+    /// Raw yt-dlp format id, e.g. "137", "251" or "248-sr" (may be non-numeric).
+    pub itag: Option<String>,
     pub container: String,
     pub quality: String,
+    pub height: Option<u32>,
     pub bitrate: u64,
     #[serde(rename = "type")]
     pub stream_type: String,
@@ -123,6 +125,7 @@ impl YoutubeDownloader {
             .args(["-f", &itag.to_string(), "-o", absolute_output.to_string_lossy().as_ref(), "--newline", "--no-playlist", &normalized])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        command.args(cookie_args());
         if let Some(parent) = self.ytdlp_path.parent() {
             command.current_dir(parent);
         }
@@ -191,6 +194,7 @@ impl YoutubeDownloader {
             .args(["-j", "--no-playlist", "--no-download", normalized])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        command.args(cookie_args());
         if let Some(parent) = ytdlp_exe.parent() {
             command.current_dir(parent);
         }
@@ -218,15 +222,25 @@ impl YoutubeDownloader {
             .unwrap_or_default()
             .into_iter()
             .filter_map(|f| {
-                let itag = f.format_id.as_ref().and_then(|id| id.parse::<u64>().ok());
                 let container = f.ext.as_deref().unwrap_or("unknown").to_string();
+                // Drop storyboards / image tiles — they aren't downloadable media.
+                if container == "mhtml" {
+                    return None;
+                }
+                let itag = f.format_id.clone().filter(|s| !s.is_empty());
                 let quality = format_quality_ytdlp(&f);
+                let height = f.height;
                 let bitrate = (f.tbr.unwrap_or(0.0) * 1000.0) as u64;
                 let (stream_type, has_video, has_audio) = stream_type_ytdlp(&f);
+                // Skip anything we can't classify (no usable video or audio stream).
+                if stream_type == "unknown" {
+                    return None;
+                }
                 Some(StreamInfo {
                     itag,
                     container,
                     quality,
+                    height,
                     bitrate,
                     stream_type,
                     has_video,
@@ -240,7 +254,7 @@ impl YoutubeDownloader {
     pub async fn download_itag_to(
         &self,
         input: &str,
-        itag: u64,
+        itag: &str,
         container: &str,
         video_id: &str,
         progress: Option<UnboundedSender<u8>>,
@@ -252,7 +266,7 @@ impl YoutubeDownloader {
         &self,
         ytdlp_exe: &Path,
         input: &str,
-        itag: u64,
+        itag: &str,
         container: &str,
         video_id: &str,
         progress: Option<&UnboundedSender<u8>>,
@@ -273,7 +287,7 @@ impl YoutubeDownloader {
         command
             .args([
                 "-f",
-                &itag.to_string(),
+                itag,
                 "-o",
                 absolute_output.to_string_lossy().as_ref(),
                 "--newline",
@@ -282,6 +296,7 @@ impl YoutubeDownloader {
             ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        command.args(cookie_args());
         if let Some(parent) = ytdlp_exe.parent() {
             command.current_dir(parent);
         }
@@ -379,6 +394,29 @@ pub async fn ensure_ytdlp_available() -> Result<(), YtdlError> {
     Ok(())
 }
 
+/// Best-effort: keep yt-dlp current so YouTube's frequent changes don't cause HTTP 403s
+/// or "format not available" errors. Switches to (and stays on) the nightly channel,
+/// which tracks YouTube fixes fastest. Failures (offline, exe busy) are logged, not fatal.
+/// Set DOWNLOADER_NO_UPDATE=1 to skip.
+pub async fn update_ytdlp() {
+    if std::env::var("DOWNLOADER_NO_UPDATE").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        log::info!("yt-dlp auto-update skipped (DOWNLOADER_NO_UPDATE set)");
+        return;
+    }
+    let Some(exe) = resolve_ytdlp_exe_path() else {
+        return;
+    };
+    log::info!("Checking yt-dlp for updates (nightly channel)…");
+    match Command::new(&exe).args(["--update-to", "nightly"]).output().await {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let last = text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+            log::info!("yt-dlp update: {}", last);
+        }
+        Err(e) => log::warn!("yt-dlp update check failed (continuing): {}", e),
+    }
+}
+
 /// Resolve the directory where yt-dlp.exe should live (same folder as downloader.exe or cwd).
 fn resolve_app_dir() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
@@ -454,7 +492,7 @@ fn format_quality_ytdlp(f: &YtdlpFormat) -> String {
 }
 
 fn stream_type_ytdlp(f: &YtdlpFormat) -> (String, bool, bool) {
-    let v = f.vcodec.as_deref().map_or(false, |c| c != "none" && !c.is_empty());
+    let v = f.vcodec.as_deref().map_or(false, |c| c != "none" && !c.is_empty() && c != "images");
     let a = f.acodec.as_deref().map_or(false, |c| c != "none" && !c.is_empty());
     let t = if v && a {
         "muxed"
@@ -493,6 +531,46 @@ fn parse_ytdlp_pct(line: &str) -> Option<i32> {
     let idx = line.find('%')?;
     let num = line[..idx].trim().split_whitespace().last()?;
     num.parse::<f64>().ok().map(|f| f as i32)
+}
+
+/// A cookies.txt file to authenticate yt-dlp with, set at runtime (e.g. by the Chrome
+/// extension via POST /cookies). Takes precedence over the env vars below.
+static COOKIES_FILE: Lazy<std::sync::Mutex<Option<PathBuf>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
+
+/// Set (or clear with None) the cookies.txt file used for all yt-dlp calls.
+pub fn set_cookies_file(path: Option<PathBuf>) {
+    if let Ok(mut g) = COOKIES_FILE.lock() {
+        *g = path;
+    }
+}
+
+/// Extra yt-dlp args for YouTube cookie authentication — needed for age-restricted
+/// or members-only videos, and a useful fallback when a plain download hits HTTP 403.
+/// Priority: the runtime cookies file (set by the Chrome extension via POST /cookies),
+/// then env vars:
+///   DOWNLOADER_COOKIES_BROWSER — e.g. "chrome", "firefox", "edge", "brave"
+///   DOWNLOADER_COOKIES_FILE    — path to an exported Netscape cookies.txt
+/// Unset/empty means no cookies are passed.
+fn cookie_args() -> Vec<String> {
+    if let Ok(g) = COOKIES_FILE.lock() {
+        if let Some(p) = g.as_ref() {
+            return vec!["--cookies".to_string(), p.display().to_string()];
+        }
+    }
+    if let Ok(browser) = std::env::var("DOWNLOADER_COOKIES_BROWSER") {
+        let b = browser.trim();
+        if !b.is_empty() {
+            return vec!["--cookies-from-browser".to_string(), b.to_string()];
+        }
+    }
+    if let Ok(file) = std::env::var("DOWNLOADER_COOKIES_FILE") {
+        let f = file.trim();
+        if !f.is_empty() {
+            return vec!["--cookies".to_string(), f.to_string()];
+        }
+    }
+    Vec::new()
 }
 
 fn normalise_input(input: &str) -> String {

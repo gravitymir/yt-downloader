@@ -427,13 +427,21 @@
                 const setFill = (p) => { if (comboFill) comboFill.style.width = Math.max(0, Math.min(100, p)) + "%"; };
                 const setLabel = (t) => { if (comboLabel) comboLabel.textContent = t; };
 
-                const findCard = (itag) => document.querySelector('.format-card[data-itag="' + itag + '"]');
-                const videoCard = findCard("137");
-                const audioCard = findCard("251");
+                // Pick dynamically from whatever yt-dlp actually offers: the best
+                // video-only stream at ≤1080p, plus the best audio-only stream.
+                const num = (v) => parseInt(v, 10) || 0;
+                const cards = Array.from(document.querySelectorAll('.format-card[data-endpoint]'));
+                const videoCard = cards
+                    .filter((c) => c.dataset.streamType === "video" && num(c.dataset.height) > 0 && num(c.dataset.height) <= 1080)
+                    .sort((a, b) => num(b.dataset.height) - num(a.dataset.height) || num(b.dataset.bitrate) - num(a.dataset.bitrate))[0];
+                const audioCard = cards
+                    .filter((c) => c.dataset.streamType === "audio")
+                    .sort((a, b) => num(b.dataset.bitrate) - num(a.dataset.bitrate))[0];
+                const videoItag = videoCard ? videoCard.dataset.itag : "";
                 if (!videoCard || !audioCard) {
                     comboBtn.disabled = true;
                     comboBtn.classList.add("unavailable");
-                    comboBtn.title = "Needs both itag 137 (1080p video) and itag 251 (audio) in this list";
+                    comboBtn.title = "Needs a ≤1080p video-only stream and an audio-only stream in this list";
                 } else {
                     const markCard = (card, cls) => {
                         card.classList.remove("loading", "success", "error");
@@ -455,11 +463,11 @@
                             await loadFiles();
                             if (!a.success) throw new Error(a.error || "Audio download failed");
 
-                            // Stage 2/3 — video (itag 137)
-                            setFill(0); setLabel("2/3 · video · 0%");
+                            // Stage 2/3 — video (itag 137, or 303 as fallback)
+                            setFill(0); setLabel("2/3 · video " + videoItag + " · 0%");
                             markCard(videoCard, "loading");
                             const v = await runDownload(videoCard.dataset.endpoint, vStatus, (p) => {
-                                setFill(p); setLabel("2/3 · video · " + p + "%");
+                                setFill(p); setLabel("2/3 · video " + videoItag + " · " + p + "%");
                             });
                             markCard(videoCard, v.success ? "success" : "error");
                             await loadFiles();

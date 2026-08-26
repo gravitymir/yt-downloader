@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use downloader::{ensure_ytdlp_available, StreamInfo, YoutubeDownloader};
+use downloader::{ensure_ytdlp_available, set_cookies_file, update_ytdlp, StreamInfo, YoutubeDownloader};
 use once_cell::sync::Lazy;
-use rusty_ytdl::{VideoFormat, VideoInfo};
+use rusty_ytdl::VideoInfo;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -64,6 +64,9 @@ impl DownloadJobStatus {
 /// Bind to host:port and run the HTTP server. Uses 127.0.0.1:port (port from DOWNLOADER_PORT or 8080).
 pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ensure_ytdlp_available().await?;
+    // Keep yt-dlp current so YouTube changes don't reintroduce 403s (best-effort, capped
+    // so a slow/absent network never blocks startup for long).
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(90), update_ytdlp()).await;
     let listen_port = port;
     let addr = format!("127.0.0.1:{}", listen_port);
     let listener = TcpListener::bind(&addr).await?;
@@ -93,14 +96,109 @@ async fn handle_connection(
     if n == 0 {
         return Ok(());
     }
+
+    let first_line = String::from_utf8_lossy(&buffer[..n])
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+
+    // CORS preflight — the Chrome extension probes before POSTing cookies.
+    if first_line.starts_with("OPTIONS ") {
+        let response = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        stream.write_all(response.as_bytes()).await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
+    // The Chrome extension uploads YouTube cookies here (body may exceed one read).
+    if first_line.starts_with("POST /cookies") {
+        return handle_post_cookies(&mut stream, &buffer[..n]).await;
+    }
+
     let request = String::from_utf8_lossy(&buffer[..n]);
     let (status, body, content_type, _) = parse_and_handle_request(&downloader, &request).await;
     let response = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
         status,
         content_type,
         body.as_bytes().len(),
         body
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+/// Receive YouTube cookies (Netscape cookies.txt) from the extension, save them,
+/// and point yt-dlp at the file for subsequent requests.
+async fn handle_post_cookies(
+    stream: &mut TcpStream,
+    initial: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Split headers from the (possibly partial) body already read.
+    let sep_pos = initial.windows(4).position(|w| w == b"\r\n\r\n");
+    let (head, mut body): (&[u8], Vec<u8>) = match sep_pos {
+        Some(p) => (&initial[..p], initial[p + 4..].to_vec()),
+        None => (initial, Vec::new()),
+    };
+    let head_str = String::from_utf8_lossy(head);
+    let content_length = head_str
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+
+    // Read the rest of the body (cookies.txt can be larger than one TCP read).
+    let mut buf = vec![0u8; 8192];
+    while body.len() < content_length {
+        let k = stream.read(&mut buf).await?;
+        if k == 0 {
+            break;
+        }
+        body.extend_from_slice(&buf[..k]);
+    }
+    if body.len() > content_length && content_length > 0 {
+        body.truncate(content_length);
+    }
+
+    let text = String::from_utf8_lossy(&body).to_string();
+    let count = text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .count();
+
+    let path = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("cookies.txt");
+    if let Err(e) = tokio::fs::write(&path, text.as_bytes()).await {
+        return write_plain(stream, "500 Internal Server Error", &format!("save failed: {}", e)).await;
+    }
+    set_cookies_file(Some(path.clone()));
+    log::info!("Saved {} cookies to {:?}", count, path);
+
+    let body_json =
+        json!({ "status": "ok", "cookies": count, "saved": path.display().to_string() }).to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body_json.as_bytes().len(),
+        body_json
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+/// Write a tiny plain-text HTTP response (used for cookie-save errors).
+async fn write_plain(
+    stream: &mut TcpStream,
+    status: &str,
+    body: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.as_bytes().len()
     );
     stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await?;
@@ -126,6 +224,14 @@ async fn parse_and_handle_request(
         None => (target, None),
     };
 
+    if path == "/health" {
+        return (
+            "200 OK".to_string(),
+            json!({ "status": "ok" }).to_string(),
+            "application/json".to_string(),
+            None,
+        );
+    }
     if path == "/files" {
         return handle_list_files().await;
     }
@@ -170,17 +276,16 @@ async fn parse_and_handle_request(
         }
     }
 
-    let (formats, formats_error) = if let Some(ref info) = maybe_video {
-        if info.formats.is_empty() {
-            match downloader.fetch_formats_via_cli(&input_value).await {
-                Ok(list) => (Some(list), None),
-                Err(e) => {
-                    log::warn!("Formats failed: {}", e);
-                    (None, Some(e.to_string()))
-                }
+    // yt-dlp is the single source of truth for formats: the ids it lists are exactly
+    // the ids it can download (including "-sr" upscaled variants), so what the user
+    // clicks always matches what actually downloads.
+    let (formats, formats_error) = if maybe_video.is_some() {
+        match downloader.fetch_formats_via_cli(&input_value).await {
+            Ok(list) => (Some(list), None),
+            Err(e) => {
+                log::warn!("Formats failed: {}", e);
+                (None, Some(e.to_string()))
             }
-        } else {
-            (None, None)
         }
     } else {
         (None, None)
@@ -211,7 +316,7 @@ async fn handle_download_request(
     };
 
     let mut video_param = None::<String>;
-    let mut itag_param = None::<u64>;
+    let mut itag_param = None::<String>;
     let mut container_param = None::<String>;
     let mut video_id_param = None::<String>;
 
@@ -219,8 +324,9 @@ async fn handle_download_request(
         match key.as_ref() {
             "video" => video_param = Some(value.into_owned()),
             "itag" => {
-                if let Ok(n) = value.parse::<u64>() {
-                    itag_param = Some(n);
+                let v = value.into_owned();
+                if !v.is_empty() {
+                    itag_param = Some(v);
                 }
             }
             "container" => container_param = Some(value.into_owned()),
@@ -245,6 +351,15 @@ async fn handle_download_request(
             None,
         );
     };
+    // yt-dlp is the single source now: every card carries the container + video id.
+    let (Some(container), Some(video_id)) = (container_param, video_id_param) else {
+        return (
+            "400 Bad Request".to_string(),
+            json!({"status":"error","message":"Missing container/video_id"}).to_string(),
+            "application/json".to_string(),
+            None,
+        );
+    };
 
     let job_id = format!("{:016x}", JOB_COUNTER.fetch_add(1, Ordering::Relaxed));
     {
@@ -265,8 +380,7 @@ async fn handle_download_request(
     let jobs_handle = DOWNLOAD_JOBS.clone();
     let video_url_clone = video_url.clone();
     let job_id_for_task = job_id.clone();
-    let container_param = container_param.clone();
-    let video_id_param = video_id_param.clone();
+    let itag_task = itag.clone();
 
     tokio::spawn(async move {
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -282,24 +396,16 @@ async fn handle_download_request(
             }
         });
 
-        let result = if let (Some(ref container), Some(ref vid_id)) = (container_param.as_ref(), video_id_param.as_ref()) {
-            downloader
-                .download_itag_to(&video_url_clone, itag, container, vid_id, Some(progress_tx))
-                .await
-                .map(|path| (path, ()))
-        } else {
-            downloader
-                .download_format_to(&video_url_clone, itag, false, Some(progress_tx))
-                .await
-                .map(|(path, _f, _i)| (path, ()))
-        };
+        let result = downloader
+            .download_itag_to(&video_url_clone, &itag_task, &container, &video_id, Some(progress_tx))
+            .await;
 
         let _ = progress_task.await;
 
         let mut jobs = jobs_handle.lock().await;
         if let Some(s) = jobs.get_mut(&job_id_for_task) {
             match result {
-                Ok((path, _)) => {
+                Ok(path) => {
                     s.percent = 100;
                     s.status = DownloadJobStatus::Completed;
                     let rel = path
@@ -308,7 +414,7 @@ async fn handle_download_request(
                         .display()
                         .to_string();
                     s.path = Some(rel.clone());
-                    s.message = Some(format!("Saved itag {} to {}", itag, rel));
+                    s.message = Some(format!("Saved itag {} to {}", itag_task, rel));
                 }
                 Err(e) => {
                     s.status = DownloadJobStatus::Failed;
@@ -951,13 +1057,7 @@ fn render_video_info(
     let raw_url = d.video_url.as_ref();
     let format_html = match formats {
         Some(s) => render_format_list_streams(s, raw_url, video_id),
-        None => {
-            if info.formats.is_empty() {
-                render_format_list_empty(formats_error)
-            } else {
-                render_format_list(&info.formats, raw_url)
-            }
-        }
+        None => render_format_list_empty(formats_error),
     };
     let thumb = select_best_thumbnail(d).map(|t| html_escape(&t.url)).unwrap_or_default();
     let thumb_html = if thumb.is_empty() {
@@ -977,7 +1077,7 @@ fn render_format_filter_radios() -> String {
         <label><input type="radio" name="format-filter" value="video"> V</label>
         <label><input type="radio" name="format-filter" value="audio"> A</label>
         <label><input type="radio" name="format-filter" value="muxed"> V & A</label>
-        <button type="button" id="combo-best" class="combo-btn" title="Download itag 137 (1080p video) + 251 (audio), then merge into a phone-ready MP4"><span class="combo-fill"></span><span class="combo-label">⬇ 1080p + 🎵 → MP4</span></button>
+        <button type="button" id="combo-best" class="combo-btn" title="Download the best ≤1080p video + best audio, then merge into a phone-ready MP4"><span class="combo-fill"></span><span class="combo-label">⬇ 1080p + 🎵 → MP4</span></button>
     </div>"#.to_string()
 }
 
@@ -1000,12 +1100,8 @@ fn render_format_list_streams(streams: &[StreamInfo], video_url: &str, video_id:
     if entries.is_empty() {
         return r#"<div class="format-list"><h3>Available formats</h3><p class="muted">No streams.</p></div>"#.to_string();
     }
-    entries.sort_by(|a, b| {
-        let a_itag = a.itag.unwrap_or(0);
-        let b_itag = b.itag.unwrap_or(0);
-        a_itag.cmp(&b_itag).then_with(|| b.bitrate.cmp(&a.bitrate))
-    });
-    entries.dedup_by_key(|s| s.itag.unwrap_or(0));
+    entries.sort_by(|a, b| a.itag.cmp(&b.itag).then_with(|| b.bitrate.cmp(&a.bitrate)));
+    entries.dedup_by(|a, b| a.itag == b.itag);
     entries.sort_by(|a, b| b.bitrate.cmp(&a.bitrate));
     let cards: String = entries
         .iter()
@@ -1016,97 +1112,39 @@ fn render_format_list_streams(streams: &[StreamInfo], video_url: &str, video_id:
 }
 
 /// Render one format as a single compact line: itag | quality | codecs | bitrate.
+/// `height`/`bitrate_num` are emitted as data-attributes so the combo button can
+/// pick the best video/audio streams client-side.
 fn render_line_card(
-    itag: u64,
+    itag: &str,
     quality: &str,
     codecs: &str,
     bitrate: &str,
     endpoint: &str,
     data_type: &str,
+    height: &str,
+    bitrate_num: u64,
 ) -> String {
     format!(
-        r##"<a class="format-card" href="#" role="button" data-endpoint="{endpoint}" data-itag="{itag}" data-stream-type="{data_type}"><span class="format-itag">{itag}</span><span class="format-sep">|</span><span class="format-quality">{quality}</span><span class="format-sep">|</span><span class="format-codecs">{codecs}</span><span class="format-sep">|</span><span class="format-meta">{bitrate}</span><span class="format-status"></span></a>"##
+        r##"<a class="format-card" href="#" role="button" data-endpoint="{endpoint}" data-itag="{itag}" data-stream-type="{data_type}" data-height="{height}" data-bitrate="{bitrate_num}"><span class="format-itag">{itag}</span><span class="format-sep">|</span><span class="format-quality">{quality}</span><span class="format-sep">|</span><span class="format-codecs">{codecs}</span><span class="format-sep">|</span><span class="format-meta">{bitrate}</span><span class="format-status"></span></a>"##
     )
 }
 
 fn render_format_card_stream(s: &StreamInfo, video_url: &str, video_id: &str) -> String {
-    let itag = s.itag.unwrap_or(0);
+    let itag = s.itag.clone().unwrap_or_default();
     let quality = html_escape(&s.quality);
     let codecs = html_escape(&s.container);
     let bitrate = html_escape(&format_bitrate(s.bitrate));
     let query = form_urlencoded::Serializer::new(String::new())
         .append_pair("video", video_url)
-        .append_pair("itag", &itag.to_string())
+        .append_pair("itag", &itag)
         .append_pair("container", &s.container)
         .append_pair("video_id", video_id)
         .finish();
     let endpoint = html_escape(&format!("/download?{query}"));
     let stream_type = s.stream_type.to_lowercase();
     let data_type = if stream_type == "muxed" { "muxed" } else if stream_type == "video" { "video" } else { "audio" };
-    render_line_card(itag, &quality, &codecs, &bitrate, &endpoint, data_type)
-}
-
-fn render_format_list(formats: &[VideoFormat], video_url: &str) -> String {
-    if formats.is_empty() {
-        return r#"<div class="format-list"><h3>Available formats</h3><p class="muted">No streams.</p></div>"#.to_string();
-    }
-    let mut entries: Vec<&VideoFormat> = formats.iter().collect();
-    entries.sort_by(|a, b| {
-        a.itag.cmp(&b.itag).then_with(|| b.bitrate.cmp(&a.bitrate))
-    });
-    entries.dedup_by_key(|f| f.itag);
-    entries.sort_by(|a, b| b.bitrate.cmp(&a.bitrate));
-    let cards: String = entries
-        .iter()
-        .map(|f| render_format_card(f, video_url))
-        .collect();
-    let filter_radios = render_format_filter_radios();
-    format!(r#"<div class="format-list"><h3>Available formats</h3>{filter_radios}<div class="format-grid">{cards}</div></div>"#)
-}
-
-fn render_format_card(fmt: &VideoFormat, video_url: &str) -> String {
-    let quality = html_escape(&format_quality(fmt));
-    let codecs = html_escape(&format_codecs(fmt));
-    let bitrate = html_escape(&format_bitrate(fmt.bitrate));
-    let query = form_urlencoded::Serializer::new(String::new())
-        .append_pair("video", video_url)
-        .append_pair("itag", &fmt.itag.to_string())
-        .finish();
-    let endpoint = html_escape(&format!("/download?{query}"));
-    let data_type = match (fmt.has_video, fmt.has_audio) {
-        (true, true) => "muxed",
-        (true, false) => "video",
-        (false, true) => "audio",
-        _ => "unknown",
-    };
-    render_line_card(fmt.itag, &quality, &codecs, &bitrate, &endpoint, data_type)
-}
-
-fn format_quality(fmt: &VideoFormat) -> String {
-    if let Some(l) = &fmt.quality_label {
-        if !l.is_empty() {
-            return l.clone();
-        }
-    }
-    if let Some(h) = fmt.height {
-        if h > 0 {
-            return format!("{}p", h);
-        }
-    }
-    if let Some(aq) = &fmt.audio_quality {
-        if !aq.is_empty() {
-            return aq.clone();
-        }
-    }
-    fmt.mime_type.container.to_uppercase()
-}
-
-fn format_codecs(fmt: &VideoFormat) -> String {
-    if fmt.mime_type.codecs.is_empty() {
-        fmt.mime_type.container.to_uppercase()
-    } else {
-        fmt.mime_type.codecs.join(", ")
-    }
+    let height = s.height.map(|h| h.to_string()).unwrap_or_default();
+    render_line_card(&itag, &quality, &codecs, &bitrate, &endpoint, data_type, &height, s.bitrate)
 }
 
 fn format_bitrate(bitrate: u64) -> String {
