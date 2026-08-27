@@ -36,6 +36,37 @@
         .alert { padding: 1rem 1.25rem; border-radius: 0.75rem; margin-bottom: 1.5rem; font-weight: 500; }
         .alert.error { background: rgba(239, 68, 68, 0.15); color: #fecaca; border: 1px solid rgba(239, 68, 68, 0.4); }
         .alert.success { background: rgba(34, 197, 94, 0.18); color: #bbf7d0; border: 1px solid rgba(34, 197, 94, 0.4); }
+        .deno-banner { margin-bottom: 1.25rem; padding: 0.9rem 1.1rem; border-radius: 0.75rem; font-size: 0.9rem; background: rgba(234, 179, 8, 0.12); border: 1px solid rgba(234, 179, 8, 0.4); color: #fde68a; }
+        .deno-banner.done { background: rgba(34, 197, 94, 0.15); border-color: rgba(34, 197, 94, 0.4); color: #bbf7d0; }
+        .deno-banner.error { background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.4); color: #fecaca; }
+        .deno-bar { margin-top: 0.6rem; height: 8px; border-radius: 999px; background: rgba(148, 163, 184, 0.25); overflow: hidden; }
+        .deno-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #38bdf8, #22d3ee); transition: width 0.2s ease; }
+
+        /* Player modal */
+        .modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; }
+        .modal[hidden] { display: none; }
+        .modal-backdrop { position: absolute; inset: 0; background: rgba(2, 6, 23, 0.72); backdrop-filter: blur(2px); }
+        .modal-box {
+            position: relative; z-index: 1; width: min(760px, 92vw); max-height: 90vh; overflow: auto;
+            background: #0f172a; border: 1px solid rgba(148, 163, 184, 0.3); border-radius: 1rem; padding: 1.25rem;
+            box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5); display: grid; gap: 0.9rem;
+        }
+        .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+        .modal-title { font-size: 1.1rem; font-weight: 600; }
+        .modal-close {
+            padding: 0.35rem 0.7rem; font-size: 1rem; line-height: 1; color: #f8fafc;
+            background: rgba(148, 163, 184, 0.18); border: 1px solid rgba(148, 163, 184, 0.3);
+        }
+        .modal-close:hover { background: rgba(239, 68, 68, 0.3); box-shadow: none; }
+        .modal-video { width: 100%; max-height: 60vh; background: #000; border-radius: 0.6rem; }
+        .modal-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; }
+        .modal-controls button { padding: 0.5rem 1rem; font-size: 0.9rem; }
+        .modal-vol { display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.9rem; color: rgba(226, 232, 240, 0.85); }
+        .modal-vol input[type="range"] { accent-color: #38bdf8; cursor: pointer; }
+        .modal-path {
+            font-size: 0.8rem; color: rgba(226, 232, 240, 0.7); word-break: break-all;
+            background: rgba(30, 41, 59, 0.6); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 0.5rem; padding: 0.5rem 0.7rem;
+        }
         .placeholder {
             padding: 2rem; border-radius: 1rem; background: rgba(148, 163, 184, 0.12);
             border: 1px dashed rgba(148, 163, 184, 0.4); color: rgba(226, 232, 240, 0.9); line-height: 1.6;
@@ -54,10 +85,22 @@
         .card .links { display: grid; gap: 0.75rem; }
         .format-list { margin-top: 1.25rem; display: grid; gap: 0.75rem; }
         .format-list h3 { margin: 0; font-size: 1.05rem; font-weight: 600; color: rgba(226, 232, 240, 0.95); }
-        .format-filter { display: flex; flex-wrap: wrap; gap: 1rem; margin: 0.5rem 0 0.75rem; align-items: center; padding: 0.5rem 0; }
-        .format-filter-label { font-size: 0.9rem; font-weight: 500; color: rgba(226, 232, 240, 0.85); margin-right: 0.25rem; }
-        .format-filter label { display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer; font-size: 0.9rem; color: rgba(226, 232, 240, 0.9); }
-        .format-filter input[type="radio"] { accent-color: #38bdf8; cursor: pointer; }
+        .format-filter { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.5rem 0 0.75rem; align-items: center; padding: 0.25rem 0; }
+        .format-filter label {
+            display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer; user-select: none;
+            padding: 0.4rem 0.7rem; border-radius: 999px; font-size: 0.9rem; font-weight: 500;
+            color: rgba(226, 232, 240, 0.8); background: rgba(30, 41, 59, 0.55);
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.12s ease;
+        }
+        .format-filter label:hover { color: #f8fafc; border-color: rgba(56, 189, 248, 0.55); transform: translateY(-1px); }
+        .format-filter input[type="radio"] { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; pointer-events: none; }
+        .format-filter label:has(input:checked) {
+            background: linear-gradient(135deg, #38bdf8, #22d3ee); color: #0f172a; font-weight: 600;
+            border-color: transparent; box-shadow: 0 6px 16px rgba(34, 211, 238, 0.22);
+        }
+        .format-filter label:has(input:focus-visible) { outline: 2px solid rgba(56, 189, 248, 0.7); outline-offset: 2px; }
+        .format-filter .fi { width: 30px; height: 30px; flex: 0 0 auto; }
         .combo-btn {
             position: relative; isolation: isolate; overflow: hidden;
             margin-left: auto; padding: 0.45rem 0.9rem; font-size: 0.85rem; font-weight: 600;
@@ -86,6 +129,8 @@
         .format-card.loading { opacity: 0.65; pointer-events: none; }
         .format-card.success { border-color: rgba(34, 197, 94, 0.6); }
         .format-card.error { border-color: rgba(239, 68, 68, 0.6); }
+        .format-empty { margin: 0.5rem 0 0; padding: 0.75rem 0.9rem; border-radius: 0.6rem; font-size: 0.9rem; color: rgba(226, 232, 240, 0.7); background: rgba(148, 163, 184, 0.1); border: 1px dashed rgba(148, 163, 184, 0.35); }
+        .format-empty[hidden] { display: none; }
         .format-itag { font-weight: 700; color: #38bdf8; font-variant-numeric: tabular-nums; min-width: 2.6rem; }
         .format-sep { color: rgba(148, 163, 184, 0.4); }
         .format-quality { font-weight: 600; }
@@ -96,6 +141,24 @@
         .format-card.error .format-status { color: #fecaca; }
         a { color: #38bdf8; }
         .muted { color: rgba(226, 232, 240, 0.65); }
+
+        /* Subtitles */
+        .subs { margin-top: 1.5rem; padding-top: 1.25rem; border-top: 1px solid rgba(148, 163, 184, 0.2); display: grid; gap: 0.75rem; }
+        .subs h3 { margin: 0; font-size: 1.05rem; font-weight: 600; color: rgba(226, 232, 240, 0.95); }
+        .subs-controls { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; }
+        .subs select {
+            padding: 0.5rem 0.7rem; border-radius: 0.6rem; font-size: 0.9rem;
+            background: rgba(15, 23, 42, 0.6); color: inherit; border: 1px solid rgba(148, 163, 184, 0.35);
+            max-width: 100%;
+        }
+        #subs-lang { flex: 1 1 240px; min-width: 0; }
+        #subs-format { flex: 0 0 auto; }
+        #subs-download { padding: 0.5rem 1rem; font-size: 0.9rem; }
+        #subs-download:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+        .subs-status { font-size: 0.85rem; min-height: 1.1rem; color: rgba(226, 232, 240, 0.8); }
+        .subs-status.error { color: #fecaca; }
+        .subs-status.success { color: #bbf7d0; }
+        .subs-status.muted { color: rgba(226, 232, 240, 0.6); }
 
         /* File explorer */
         .explorer {
@@ -170,7 +233,27 @@
             <input type="text" name="url" placeholder="https://www.youtube.com/watch?v=..." value="{{ESCAPED_INPUT}}" autocomplete="off" />
             <button type="submit" id="check-btn">Check video</button>
         </form>
+        <div id="deno-banner" class="deno-banner" hidden>
+            <div id="deno-msg"></div>
+            <div class="deno-bar" id="deno-bar"><div class="deno-fill" id="deno-fill"></div></div>
+        </div>
         {{RESULT_SECTION}}
+    </div>
+    <div id="player-modal" class="modal" hidden aria-modal="true" role="dialog">
+        <div class="modal-backdrop" data-close></div>
+        <div class="modal-box">
+            <div class="modal-head">
+                <span class="modal-title">Результат</span>
+                <button type="button" class="modal-close" data-close aria-label="Закрыть">✕ Закрыть</button>
+            </div>
+            <video id="player-video" class="modal-video" playsinline preload="metadata"></video>
+            <div class="modal-controls">
+                <button type="button" id="player-play">▶ Play</button>
+                <button type="button" id="player-stop">⏹ Stop</button>
+                <label class="modal-vol">🔊 <input type="range" id="player-vol" min="0" max="1" step="0.05" value="1"></label>
+            </div>
+            <div class="modal-path" id="player-path"></div>
+        </div>
     </div>
     <script>
         document.addEventListener("DOMContentLoaded", () => {
@@ -189,6 +272,73 @@
                     // Re-enable shortly after in case navigation is cancelled (e.g. back button).
                     setTimeout(() => { checkBtn.disabled = true; }, 0);
                 });
+            }
+
+            // ---- Auto-install deno (JS runtime yt-dlp needs for some videos) ----
+            (function initDeno() {
+                const banner = document.getElementById("deno-banner");
+                const msg = document.getElementById("deno-msg");
+                const bar = document.getElementById("deno-bar");
+                const fill = document.getElementById("deno-fill");
+                if (!banner) return;
+                const show = (text, cls) => { banner.hidden = false; msg.textContent = text; banner.className = "deno-banner" + (cls ? " " + cls : ""); };
+                const setPct = (p) => { fill.style.width = (p || 0) + "%"; };
+                const poll = async () => {
+                    try {
+                        const r = await fetch("/deno-status", { headers: { "X-Requested-With": "fetch" } });
+                        const d = await r.json();
+                        if (d.installed) { setPct(100); bar.style.display = "none"; show("JS-движок (deno) установлен ✓", "done"); return; }
+                        if (d.error) { bar.style.display = "none"; show("Не удалось установить deno: " + d.error, "error"); return; }
+                        if (d.downloading) { setPct(d.percent); show("Загрузка JS-движка (deno)… " + (d.percent || 0) + "%"); setTimeout(poll, 500); return; }
+                        // Missing and idle → kick off the install.
+                        show("Устанавливаю JS-движок (deno) для полной поддержки видео…");
+                        await fetch("/install-deno", { headers: { "X-Requested-With": "fetch" } });
+                        setTimeout(poll, 500);
+                    } catch (e) { bar.style.display = "none"; show("Ошибка проверки deno: " + (e.message || e), "error"); }
+                };
+                (async () => {
+                    try {
+                        const r = await fetch("/deno-status", { headers: { "X-Requested-With": "fetch" } });
+                        const d = await r.json();
+                        if (!d.installed) poll();
+                    } catch (e) { /* ignore — banner stays hidden */ }
+                })();
+            })();
+
+            // ---- Player modal (minimal: play/stop, volume, close) ----
+            let downloadedDir = null;
+            fetch("/downloaded-dir", { headers: { "X-Requested-With": "fetch" } })
+                .then((r) => r.json()).then((d) => { downloadedDir = d.path || null; }).catch(() => {});
+            const playerModal = document.getElementById("player-modal");
+            const playerVideo = document.getElementById("player-video");
+            const playerPlay = document.getElementById("player-play");
+            const playerStop = document.getElementById("player-stop");
+            const playerVol = document.getElementById("player-vol");
+            const playerPath = document.getElementById("player-path");
+            const closePlayer = () => {
+                if (!playerModal) return;
+                if (playerVideo) { playerVideo.pause(); playerVideo.removeAttribute("src"); playerVideo.load(); }
+                playerModal.hidden = true;
+            };
+            const openPlayer = (name) => {
+                if (!playerModal || !name) return;
+                playerVideo.src = "/file?name=" + encodeURIComponent(name);
+                playerVideo.volume = playerVol ? parseFloat(playerVol.value) : 1;
+                playerVideo.load();
+                playerPath.textContent = downloadedDir ? (downloadedDir + "\\" + name) : name;
+                if (playerPlay) playerPlay.textContent = "▶ Play";
+                playerModal.hidden = false;
+            };
+            if (playerModal) {
+                playerModal.querySelectorAll("[data-close]").forEach((el) => el.addEventListener("click", closePlayer));
+                document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !playerModal.hidden) closePlayer(); });
+                if (playerPlay) playerPlay.addEventListener("click", () => { if (playerVideo.paused) playerVideo.play(); else playerVideo.pause(); });
+                if (playerStop) playerStop.addEventListener("click", () => { playerVideo.pause(); playerVideo.currentTime = 0; });
+                if (playerVol) playerVol.addEventListener("input", () => { playerVideo.volume = parseFloat(playerVol.value); });
+                if (playerVideo) {
+                    playerVideo.addEventListener("play", () => { if (playerPlay) playerPlay.textContent = "⏸ Pause"; });
+                    playerVideo.addEventListener("pause", () => { if (playerPlay) playerPlay.textContent = "▶ Play"; });
+                }
             }
 
             // ---- File explorer + merge ----
@@ -357,16 +507,105 @@
             }
 
             loadFiles();
-            document.querySelectorAll('input[name="format-filter"]').forEach((radio) => {
-                radio.addEventListener("change", () => {
-                    const value = radio.value;
-                    document.querySelectorAll(".format-card[data-stream-type]").forEach((card) => {
-                        const type = card.dataset.streamType;
-                        const show = value === "all" || type === value;
-                        card.dataset.hidden = show ? "false" : "true";
-                    });
+
+            // ---- Subtitles (shown only under the SUB filter; list loads lazily) ----
+            const subsPanel = document.getElementById("subs");
+            let subsLoaded = false;
+            let loadSubs = () => {};
+            if (subsPanel) {
+                const langSel = document.getElementById("subs-lang");
+                const fmtSel = document.getElementById("subs-format");
+                const subsDl = document.getElementById("subs-download");
+                const subsStat = document.getElementById("subs-status");
+                const video = subsPanel.dataset.video;
+                const setSubStatus = (m, k) => { subsStat.textContent = m || ""; subsStat.className = "subs-status" + (k ? " " + k : ""); };
+
+                loadSubs = async () => {
+                    if (subsLoaded) return;
+                    subsLoaded = true;
+                    setSubStatus("Загрузка списка субтитров…");
+                    try {
+                        const res = await fetch("/subtitles?video=" + encodeURIComponent(video), { headers: { "X-Requested-With": "fetch" } });
+                        const data = await res.json();
+                        if (data.status !== "ok") { langSel.innerHTML = '<option value="">—</option>'; setSubStatus(data.message || "Не удалось получить субтитры", "error"); subsLoaded = false; return; }
+                        const tracks = data.tracks || [];
+                        if (!tracks.length) { langSel.innerHTML = '<option value="">Нет субтитров</option>'; setSubStatus("У этого видео нет субтитров.", "muted"); return; }
+                        langSel.innerHTML = "";
+                        for (const t of tracks) {
+                            const opt = document.createElement("option");
+                            opt.value = t.kind + ":" + t.lang;
+                            const kindLabel = t.kind === "manual" ? "ручные" : "авто";
+                            const name = (t.name && t.name !== t.lang) ? " — " + t.name : "";
+                            opt.textContent = t.lang + name + " (" + kindLabel + ")";
+                            langSel.appendChild(opt);
+                        }
+                        langSel.disabled = false; subsDl.disabled = false;
+                        setSubStatus(tracks.length + " дорожек доступно", "muted");
+                    } catch (err) {
+                        langSel.innerHTML = '<option value="">—</option>';
+                        setSubStatus("Ошибка загрузки списка: " + (err.message || err), "error");
+                        subsLoaded = false;
+                    }
+                };
+
+                subsDl.addEventListener("click", async () => {
+                    const val = langSel.value;
+                    if (!val) return;
+                    const idx = val.indexOf(":");
+                    const kind = val.slice(0, idx);
+                    const lang = val.slice(idx + 1);
+                    const format = fmtSel.value;
+                    subsDl.disabled = true;
+                    setSubStatus("Скачивание субтитров (" + lang + ", " + format + ")…");
+                    try {
+                        const params = new URLSearchParams({ video, lang, format, kind });
+                        const res = await fetch("/download-subs?" + params.toString(), { headers: { "X-Requested-With": "fetch" } });
+                        const data = await res.json();
+                        if (data.status === "ok") { setSubStatus("Сохранено: " + (data.output || ""), "success"); loadFiles(); }
+                        else setSubStatus(data.message || "Не удалось скачать", "error");
+                    } catch (err) {
+                        setSubStatus("Ошибка: " + (err.message || err), "error");
+                    }
+                    subsDl.disabled = false;
                 });
+            }
+
+            // Filter radios: ALL/V/A/V&A filter format cards; SUB swaps to the subtitles panel.
+            const formatGrid = document.querySelector(".format-grid");
+            const emptyMsg = document.getElementById("format-empty");
+            const emptyLabels = {
+                all: "форматов",
+                video: "форматов «только видео»",
+                audio: "форматов «только звук»",
+                muxed: "форматов со звуком и видео в одном файле",
+            };
+            const applyFilter = (value) => {
+                const isSub = value === "sub";
+                if (subsPanel) subsPanel.style.display = isSub ? "" : "none";
+                if (formatGrid) formatGrid.style.display = isSub ? "none" : "";
+                if (emptyMsg && isSub) emptyMsg.hidden = true;
+                if (isSub) { loadSubs(); return; }
+                let visible = 0;
+                document.querySelectorAll(".format-card[data-stream-type]").forEach((card) => {
+                    const type = card.dataset.streamType;
+                    const show = value === "all" || type === value;
+                    card.dataset.hidden = show ? "false" : "true";
+                    if (show) visible++;
+                });
+                if (emptyMsg) {
+                    if (visible === 0) {
+                        emptyMsg.textContent = "В этом видео нет " + (emptyLabels[value] || "таких форматов") + ".";
+                        emptyMsg.hidden = false;
+                    } else {
+                        emptyMsg.hidden = true;
+                    }
+                }
+            };
+            document.querySelectorAll('input[name="format-filter"]').forEach((radio) => {
+                radio.addEventListener("change", () => applyFilter(radio.value));
             });
+            const checkedFilter = document.querySelector('input[name="format-filter"]:checked');
+            applyFilter(checkedFilter ? checkedFilter.value : "all");
             // Start a download for an endpoint and poll it to completion.
             // Returns { success, message, error, path } — path is the saved file name.
             const runDownload = async (endpoint, statusEl, onPercent) => {
@@ -448,6 +687,7 @@
                 const comboFill = comboBtn.querySelector(".combo-fill");
                 const comboLabel = comboBtn.querySelector(".combo-label");
                 const idleLabel = comboLabel ? comboLabel.textContent : "1080p + audio → MP4";
+                let comboResult = null;
                 const setFill = (p) => { if (comboFill) comboFill.style.width = Math.max(0, Math.min(100, p)) + "%"; };
                 const setLabel = (t) => { if (comboLabel) comboLabel.textContent = t; };
 
@@ -473,6 +713,8 @@
                     };
                     comboBtn.addEventListener("click", async () => {
                         if (comboBtn.disabled) return;
+                        // Already merged → open the player instead of downloading again.
+                        if (comboResult) { openPlayer(comboResult); return; }
                         comboBtn.disabled = true;
                         const vStatus = videoCard.querySelector(".format-status");
                         const aStatus = audioCard.querySelector(".format-status");
@@ -505,11 +747,13 @@
                                 setFill(p); setLabel("3/3 · merging · " + p + "%");
                             });
                             if (!m.success) throw new Error(m.error || "Merge failed");
-                            setFill(100); setLabel("✓ done");
+                            setFill(100);
                             setStatus(m.message || "Merged.", "success");
                             await loadFiles();
-                            // Restore the idle caption a few seconds after success.
-                            setTimeout(() => { if (!comboBtn.disabled) { setFill(0); setLabel(idleLabel); } }, 4000);
+                            // Keep the result: the button now opens the player instead of re-downloading.
+                            comboResult = m.path;
+                            setLabel("▶ Show result");
+                            comboBtn.classList.add("has-result");
                         } catch (err) {
                             setFill(0); setLabel("⚠ retry");
                             setStatus("Failed: " + (err.message || err), "error");
