@@ -663,6 +663,30 @@ fn is_safe_filename(name: &str) -> bool {
         && !name.contains('\0')
 }
 
+/// Turn a video title into a filesystem-safe base name (no extension): strip the
+/// characters Windows/Linux forbid, collapse whitespace, drop trailing dots/spaces,
+/// and cap the length. Falls back to "audio" if nothing usable remains.
+fn safe_output_base(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+            c if (c as u32) < 0x20 => ' ',
+            c => c,
+        })
+        .collect();
+    // Collapse runs of whitespace, then trim trailing dots/spaces (Windows dislikes them).
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim().trim_end_matches('.').trim();
+    let capped: String = trimmed.chars().take(120).collect();
+    let capped = capped.trim().to_string();
+    if capped.is_empty() {
+        "audio".to_string()
+    } else {
+        capped
+    }
+}
+
 /// Build the standard JSON-error response tuple used by /files and /merge.
 fn json_error(message: &str) -> (String, String, String, Option<PathBuf>) {
     (
@@ -927,12 +951,26 @@ async fn handle_merge(query: Option<&str>) -> (String, String, String, Option<Pa
     };
 
     let mut files: Vec<String> = Vec::new();
+    let mut desired_name: Option<String> = None;
+    let mut cleanup = false;
     for (key, value) in form_urlencoded::parse(q.as_bytes()) {
-        if key == "files" {
-            let v = value.into_owned();
-            if !v.is_empty() {
-                files.push(v);
+        match key.as_ref() {
+            "files" => {
+                let v = value.into_owned();
+                if !v.is_empty() {
+                    files.push(v);
+                }
             }
+            // Name the output after the video title (used by the combo button).
+            "name" => {
+                let v = value.into_owned();
+                if !v.trim().is_empty() {
+                    desired_name = Some(v);
+                }
+            }
+            // Delete the technical input files after a successful merge.
+            "cleanup" => cleanup = value == "1" || value == "true",
+            _ => {}
         }
     }
 
@@ -989,7 +1027,11 @@ async fn handle_merge(query: Option<&str>) -> (String, String, String, Option<Pa
         );
     };
 
-    let out_name = format!("{}_telegram.mp4", derive_merge_base(&files));
+    // Name the output after the YouTube title when provided, else the derived base.
+    let out_name = match &desired_name {
+        Some(n) => format!("{}.mp4", safe_output_base(n)),
+        None => format!("{}_telegram.mp4", derive_merge_base(&files)),
+    };
     let out_path = dir.join(&out_name);
 
     // Probe the source duration up front so ffmpeg's time-based progress can be
@@ -1017,6 +1059,7 @@ async fn handle_merge(query: Option<&str>) -> (String, String, String, Option<Pa
     let job_id_task = job_id.clone();
     let ffmpeg = resolve_ffmpeg();
     let out_name_task = out_name.clone();
+    let cleanup_task = cleanup;
 
     tokio::spawn(async move {
         // Re-encode to H.264 High / yuv420p + AAC with faststart — the broadly
@@ -1092,23 +1135,35 @@ async fn handle_merge(query: Option<&str>) -> (String, String, String, Option<Pa
 
         let status = child.wait().await;
         let stderr_bytes = stderr_task.await.unwrap_or_default();
+        let merged_ok = matches!(&status, Ok(st) if st.success());
 
-        let mut jobs = jobs_handle.lock().await;
-        if let Some(s) = jobs.get_mut(&job_id_task) {
-            match status {
-                Ok(st) if st.success() => {
-                    s.percent = 100;
-                    s.status = DownloadJobStatus::Completed;
-                    s.path = Some(out_name_task.clone());
-                    s.message = Some(format!("Merged into {}", out_name_task));
+        {
+            let mut jobs = jobs_handle.lock().await;
+            if let Some(s) = jobs.get_mut(&job_id_task) {
+                match status {
+                    Ok(st) if st.success() => {
+                        s.percent = 100;
+                        s.status = DownloadJobStatus::Completed;
+                        s.path = Some(out_name_task.clone());
+                        s.message = Some(format!("Merged into {}", out_name_task));
+                    }
+                    Ok(_) => {
+                        s.status = DownloadJobStatus::Failed;
+                        s.error = Some(format!("ffmpeg failed: {}", ffmpeg_stderr_tail(&stderr_bytes)));
+                    }
+                    Err(e) => {
+                        s.status = DownloadJobStatus::Failed;
+                        s.error = Some(format!("ffmpeg wait failed: {}", e));
+                    }
                 }
-                Ok(_) => {
-                    s.status = DownloadJobStatus::Failed;
-                    s.error = Some(format!("ffmpeg failed: {}", ffmpeg_stderr_tail(&stderr_bytes)));
-                }
-                Err(e) => {
-                    s.status = DownloadJobStatus::Failed;
-                    s.error = Some(format!("ffmpeg wait failed: {}", e));
+            }
+        }
+
+        // On success, delete the two technical inputs (video + audio streams).
+        if merged_ok && cleanup_task {
+            for p in [&video_input, &audio_input] {
+                if p.as_path() != out_path.as_path() {
+                    let _ = tokio::fs::remove_file(p).await;
                 }
             }
         }
@@ -1178,12 +1233,26 @@ async fn handle_to_mp3(query: Option<&str>) -> (String, String, String, Option<P
     };
 
     let mut files: Vec<String> = Vec::new();
+    let mut desired_name: Option<String> = None;
+    let mut cleanup = false;
     for (key, value) in form_urlencoded::parse(q.as_bytes()) {
-        if key == "files" {
-            let v = value.into_owned();
-            if !v.is_empty() {
-                files.push(v);
+        match key.as_ref() {
+            "files" => {
+                let v = value.into_owned();
+                if !v.is_empty() {
+                    files.push(v);
+                }
             }
+            // Optional: name the output after the video title (used by the MP3 button).
+            "name" => {
+                let v = value.into_owned();
+                if !v.trim().is_empty() {
+                    desired_name = Some(v);
+                }
+            }
+            // Delete the technical source file after a successful conversion.
+            "cleanup" => cleanup = value == "1" || value == "true",
+            _ => {}
         }
     }
     if files.is_empty() {
@@ -1216,10 +1285,19 @@ async fn handle_to_mp3(query: Option<&str>) -> (String, String, String, Option<P
             continue;
         }
 
-        let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
-        let out_name = format!("{}.mp3", stem);
+        // Prefer the YouTube title (sanitized) when converting a single file; otherwise
+        // keep the source stem. is_safe_filename guards against path escapes either way.
+        let out_name = match (&desired_name, files.len()) {
+            (Some(n), 1) => format!("{}.mp3", safe_output_base(n)),
+            _ => {
+                let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+                format!("{}.mp3", stem)
+            }
+        };
         let out_path = dir.join(&out_name);
 
+        // 192 kbps CBR, 44.1 kHz stereo, ID3v2.3 + v1 tags — the broadly compatible
+        // MP3 combo for Telegram, iPhone and Android.
         let mut command = Command::new(&ffmpeg);
         command
             .arg("-y")
@@ -1230,12 +1308,26 @@ async fn handle_to_mp3(query: Option<&str>) -> (String, String, String, Option<P
             .arg("libmp3lame")
             .arg("-b:a")
             .arg("192k")
+            .arg("-ar")
+            .arg("44100")
+            .arg("-ac")
+            .arg("2")
+            .arg("-id3v2_version")
+            .arg("3")
+            .arg("-write_id3v1")
+            .arg("1")
             .arg(&out_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
         match command.output().await {
-            Ok(out) if out.status.success() => outputs.push(out_name),
+            Ok(out) if out.status.success() => {
+                // Remove the technical source once the MP3 exists (opt-in via cleanup).
+                if cleanup && out_name != *name {
+                    let _ = tokio::fs::remove_file(&path).await;
+                }
+                outputs.push(out_name);
+            }
             Ok(out) => errors.push(format!("{}: {}", name, ffmpeg_stderr_tail(&out.stderr))),
             Err(e) => errors.push(format!("{}: could not run ffmpeg ({}): {}", name, ffmpeg.display(), e)),
         }
@@ -1396,7 +1488,7 @@ fn render_video_info(
     };
     let subs_html = render_subtitles_panel(raw_url, video_id);
     format!(
-        r#"<div class="card"><div class="card-head">{thumb_html}<div class="meta"><h2><a href="{video_url}" target="_blank" rel="noopener">{title}</a></h2><div class="stats"><span>👤 {channel}</span><span>⏱ {duration}</span><span>👁 {views} views</span><span>📅 {publish_date}</span></div></div></div><div class="links">{format_html}{subs_html}</div></div>"#
+        r#"<div class="card"><div class="card-head">{thumb_html}<div class="meta"><h2><a href="{video_url}" target="_blank" rel="noopener">{title}</a></h2><div class="stats"><span>👤 {channel}</span><span>⏱ {duration}</span><span>👁 {views} views</span><span>📅 {publish_date}</span></div></div></div><div class="links"><span id="yt-title" data-title="{title}" hidden></span>{format_html}{subs_html}</div></div>"#
     )
 }
 
@@ -1417,6 +1509,7 @@ fn render_format_filter_radios() -> String {
         <label title="Только звук / Audio only"><input type="radio" name="format-filter" value="audio"><svg class="fi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></label>
         <label title="Видео + звук / Video &amp; Audio"><input type="radio" name="format-filter" value="muxed"><svg class="fi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 3v18M17 3v18M3 7.5h4M17 7.5h4M3 12h18M3 16.5h4M17 16.5h4"/></svg></label>
         <label title="Субтитры / Subtitles"><input type="radio" name="format-filter" value="sub"><svg class="fi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 15h4M15 15h2M7 11h2M13 11h4"/></svg></label>
+        <button type="button" id="combo-mp3" class="combo-btn" title="Download the best audio and convert to an MP3 optimized for Telegram / iPhone / Android"><span class="combo-fill"></span><span class="combo-label">🎵 → MP3</span></button>
         <button type="button" id="combo-best" class="combo-btn" title="Download the best ≤1080p video + best audio, then merge into a phone-ready MP4"><span class="combo-fill"></span><span class="combo-label">⬇ 1080p + 🎵 → MP4</span></button>
     </div>"#.to_string()
 }

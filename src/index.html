@@ -117,6 +117,8 @@
             display: inline-block; white-space: nowrap;
         }
         .combo-btn.unavailable { opacity: 0.45; cursor: not-allowed; }
+        /* Group the action buttons together at the right: only the first gets the auto push. */
+        #combo-best { margin-left: 0; }
         .format-card[data-hidden="true"] { display: none; }
         .format-grid { display: grid; gap: 0.4rem; }
         .format-card {
@@ -631,9 +633,12 @@
             };
 
             // Start a merge job and poll it to completion. Returns { success, message, error, path }.
-            const runMerge = async (files, onPercent) => {
+            // opts: { name } → output named after the video title; { cleanup } → delete inputs.
+            const runMerge = async (files, onPercent, opts) => {
                 const params = new URLSearchParams();
                 files.forEach((name) => params.append("files", name));
+                if (opts && opts.name) params.append("name", opts.name);
+                if (opts && opts.cleanup) params.append("cleanup", "1");
                 const res = await fetch("/merge?" + params.toString(), { headers: { "X-Requested-With": "fetch" } });
                 const text = await res.text();
                 let data; try { data = JSON.parse(text); } catch { throw new Error(text || "Unexpected response"); }
@@ -740,12 +745,14 @@
                             if (!v.success) throw new Error(v.error || "Video download failed");
                             if (!a.path || !v.path) throw new Error("Could not determine downloaded file names to merge");
 
-                            // Stage 3/3 — merge
+                            // Stage 3/3 — merge (name after the YouTube title, delete inputs)
                             setFill(0); setLabel("3/3 · merging · 0%");
-                            setStatus("Merging 137 + 251 into a phone-ready MP4…");
+                            setStatus("Merging into a phone-ready MP4…");
+                            const titleEl = document.getElementById("yt-title");
+                            const ytTitle = titleEl ? (titleEl.dataset.title || "") : "";
                             const m = await runMerge([v.path, a.path], (p) => {
                                 setFill(p); setLabel("3/3 · merging · " + p + "%");
-                            });
+                            }, { name: ytTitle, cleanup: true });
                             if (!m.success) throw new Error(m.error || "Merge failed");
                             setFill(100);
                             setStatus(m.message || "Merged.", "success");
@@ -759,6 +766,89 @@
                             setStatus("Failed: " + (err.message || err), "error");
                         } finally {
                             comboBtn.disabled = false;
+                        }
+                    });
+                }
+            }
+
+            // One-click: best audio → MP3 optimized for Telegram/iPhone/Android.
+            const mp3ComboBtn = document.getElementById("combo-mp3");
+            if (mp3ComboBtn) {
+                const fill = mp3ComboBtn.querySelector(".combo-fill");
+                const label = mp3ComboBtn.querySelector(".combo-label");
+                let mp3Result = null;
+                const setFill = (p) => { if (fill) fill.style.width = Math.max(0, Math.min(100, p)) + "%"; };
+                const setLabel = (t) => { if (label) label.textContent = t; };
+                const num = (v) => parseInt(v, 10) || 0;
+                const cards = Array.from(document.querySelectorAll('.format-card[data-endpoint]'));
+                // Preferred audio itags, in order; fall back to the best audio-only stream.
+                const PRIORITY = ["251", "140", "250", "249"];
+                let audioCard = null;
+                for (const it of PRIORITY) {
+                    audioCard = cards.find((c) => c.dataset.itag === it);
+                    if (audioCard) break;
+                }
+                if (!audioCard) {
+                    audioCard = cards
+                        .filter((c) => c.dataset.streamType === "audio")
+                        .sort((a, b) => num(b.dataset.bitrate) - num(a.dataset.bitrate))[0];
+                }
+                if (!audioCard) {
+                    mp3ComboBtn.disabled = true;
+                    mp3ComboBtn.classList.add("unavailable");
+                    mp3ComboBtn.title = "No audio-only stream in this list";
+                } else {
+                    const aItag = audioCard.dataset.itag;
+                    mp3ComboBtn.addEventListener("click", async () => {
+                        if (mp3ComboBtn.disabled) return;
+                        // Already converted → open the player instead of redoing the work.
+                        if (mp3Result) { openPlayer(mp3Result); return; }
+                        mp3ComboBtn.disabled = true;
+                        const aStatus = audioCard.querySelector(".format-status");
+                        audioCard.classList.remove("success", "error"); audioCard.classList.add("loading");
+                        try {
+                            // Stage 1/2 — download the chosen audio stream.
+                            setFill(0); setLabel("1/2 · audio " + aItag + " · 0%");
+                            const a = await runDownload(audioCard.dataset.endpoint, aStatus, (p) => {
+                                setFill(p); setLabel("1/2 · audio " + aItag + " · " + p + "%");
+                            });
+                            audioCard.classList.remove("loading");
+                            audioCard.classList.add(a.success ? "success" : "error");
+                            await loadFiles();
+                            if (!a.success) throw new Error(a.error || "Audio download failed");
+                            if (!a.path) throw new Error("Could not determine the downloaded file name");
+
+                            if (a.path.toLowerCase().endsWith(".mp3")) {
+                                mp3Result = a.path;
+                            } else {
+                                // Stage 2/2 — convert to a Telegram/phone-ready MP3,
+                                // named after the YouTube title (server sanitizes it).
+                                setFill(100); setLabel("2/2 · → mp3…");
+                                setStatus("Converting audio to MP3 (Telegram/iPhone/Android)…");
+                                const titleEl = document.getElementById("yt-title");
+                                const ytTitle = titleEl ? (titleEl.dataset.title || "") : "";
+                                const params = new URLSearchParams();
+                                params.append("files", a.path);
+                                if (ytTitle) params.append("name", ytTitle);
+                                params.append("cleanup", "1");
+                                const res = await fetch("/to-mp3?" + params.toString(), { headers: { "X-Requested-With": "fetch" } });
+                                const data = await res.json();
+                                if (data.status !== "ok" || !data.outputs || !data.outputs.length) {
+                                    throw new Error(data.message || "MP3 conversion failed");
+                                }
+                                mp3Result = data.outputs[0];
+                                setStatus(data.message || "Converted to MP3.", "success");
+                            }
+                            setFill(100);
+                            await loadFiles();
+                            setLabel("▶ Show result");
+                            mp3ComboBtn.classList.add("has-result");
+                        } catch (err) {
+                            audioCard.classList.remove("loading");
+                            setFill(0); setLabel("⚠ retry");
+                            setStatus("Failed: " + (err.message || err), "error");
+                        } finally {
+                            mp3ComboBtn.disabled = false;
                         }
                     });
                 }
